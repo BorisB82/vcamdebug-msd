@@ -1,0 +1,50 @@
+name: Build VCamControl app (roothide)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: brew install ldid xz
+
+      - name: Install roothide Theos (ignore its SDK auto-download)
+        run: |
+          export THEOS=$HOME/theos
+          bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)" || true
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+
+      - name: Verify Theos cloned
+        run: |
+          test -d "$THEOS/vendor/include" && test -f "$THEOS/makefiles/common.mk" \
+            && echo "Theos OK at $THEOS" || (echo "Theos missing"; exit 1)
+
+      - name: Download iOS 16.5 SDK
+        run: |
+          mkdir -p "$THEOS/sdks"
+          for i in 1 2 3 4 5; do
+            curl -L --fail -o sdk.tar.xz \
+              https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz \
+              && break
+            echo "SDK download attempt $i failed, retrying in 10s..."; sleep 10
+          done
+          tar -xf sdk.tar.xz -C "$THEOS/sdks/"
+
+      - name: Build app package (roothide scheme)
+        run: |
+          cd VCamControl
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vcamcontrol-roothide-deb
+          path: VCamControl/packages/*.deb
+          retention-days: 30

@@ -1,0 +1,10 @@
+# Build + source consumed on macOS CI runners — force LF so make/bash don't choke on CRLF.
+* text=auto eol=lf
+*.m    text eol=lf
+*.h    text eol=lf
+*.xm   text eol=lf
+Makefile text eol=lf
+*.yml  text eol=lf
+*.plist text eol=lf
+control text eol=lf
+*.md   text eol=lf
