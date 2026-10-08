@@ -15,10 +15,13 @@ jobs:
       - name: Install build dependencies
         run: brew install ldid xz
 
-      - name: Install roothide Theos (ignore its SDK auto-download)
+      - name: Clone roothide Theos
         run: |
-          export THEOS=$HOME/theos
-          bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)" || true
+          # Clone directly instead of running install-theos: that script's Homebrew
+          # dependency phase aborts on the macos-14 openssl@1.1 -> openssl@3 link
+          # conflict before Theos is ever cloned. A recursive git clone pulls the
+          # same tree (incl. submodules) without touching brew.
+          git clone --recursive https://github.com/roothide/theos.git "$HOME/theos"
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
       - name: Verify Theos cloned
