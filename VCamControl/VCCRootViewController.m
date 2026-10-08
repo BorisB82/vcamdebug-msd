@@ -1,6 +1,7 @@
 #import "VCCRootViewController.h"
 #import <notify.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <PhotosUI/PhotosUI.h>
 
 // Must match VCamCore.m in the tweak.
 static NSString *const kConfigPlist = @"/var/mobile/Media/DCIM/vcam_msd.plist";
@@ -12,7 +13,8 @@ static NSString *const kNoteDisable = @"com.vcamplus.msd.disable";
 static NSString *const kNoteToggle  = @"com.vcamplus.msd.toggle";
 static NSString *const kNoteReload  = @"com.vcamplus.msd.reload";
 
-@interface VCCRootViewController () <UITableViewDataSource, UITableViewDelegate, UIDocumentPickerDelegate>
+@interface VCCRootViewController () <UITableViewDataSource, UITableViewDelegate,
+                                     UIDocumentPickerDelegate, PHPickerViewControllerDelegate>
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSArray<NSString *> *clips;   // absolute paths
@@ -109,10 +111,25 @@ static NSString *const kNoteReload  = @"com.vcamplus.msd.reload";
 - (void)tapDisable { notify_post(kNoteDisable.UTF8String); [self flash:@"Disabled"]; [self refreshStatusSoon]; }
 - (void)tapToggle  { notify_post(kNoteToggle.UTF8String);  [self flash:@"Toggled"];  [self refreshStatusSoon]; }
 
-// Open the system document picker for video files. asCopy:YES hands us a temporary copy we
-// fully own (no security-scoped bookmarking), which we then relocate into DCIM so mediaserverd
-// can read it.
+// Offer both sources: Photos (AirDropped / camera-roll clips live here, invisible to the
+// Files picker) and Files (iCloud Drive / On My iPhone / other providers).
 - (void)tapSelectFile {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Select source clip"
+                                                                  message:nil
+                                                           preferredStyle:UIAlertControllerStyleActionSheet];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Photos Library" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) { [self openPhotosPicker]; }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Files…" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) { [self openFilesPicker]; }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    // iPhone-only target, but anchor the popover anyway so it never asserts.
+    sheet.popoverPresentationController.sourceView = self.view;
+    sheet.popoverPresentationController.sourceRect =
+        CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 0, 0);
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)openFilesPicker {
     NSArray<UTType *> *types = @[ UTTypeMovie, UTTypeQuickTimeMovie, UTTypeMPEG4Movie, UTTypeVideo ];
     UIDocumentPickerViewController *picker =
         [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types asCopy:YES];
@@ -121,24 +138,74 @@ static NSString *const kNoteReload  = @"com.vcamplus.msd.reload";
     [self presentViewController:picker animated:YES completion:nil];
 }
 
+- (void)openPhotosPicker {
+    PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
+    cfg.filter = [PHPickerFilter videosFilter];
+    cfg.selectionLimit = 1;
+    PHPickerViewController *picker = [[PHPickerViewController alloc] initWithConfiguration:cfg];
+    picker.delegate = self;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+#pragma mark Files picker
+
 - (void)documentPicker:(UIDocumentPickerViewController *)controller
 didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     NSURL *src = urls.firstObject;
     if (!src) return;
+    NSError *err = nil;
+    NSString *dest = [self importClipAtURL:src suggestedName:nil error:&err];
+    if (dest) { [self selectClip:dest]; [self refresh]; }
+    else [self alert:@"Could not import file" message:err.localizedDescription ?: @"copy failed"];
+}
 
-    // Copy into DCIM (daemon-readable). Overwrite a same-named existing import.
-    NSString *dest = [kScanDir stringByAppendingPathComponent:src.lastPathComponent];
+#pragma mark Photos picker
+
+- (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
+    [picker dismissViewControllerAnimated:YES completion:nil];
+    NSItemProvider *ip = results.firstObject.itemProvider;
+    if (!ip) return;
+
+    NSString *typeId = UTTypeMovie.identifier;
+    if (![ip hasItemConformingToTypeIdentifier:typeId]) typeId = UTTypeMPEG4Movie.identifier;
+    NSString *suggested = ip.suggestedName;
+
+    // The provided URL is a temp copy valid only for the duration of this handler, so copy
+    // it into DCIM synchronously here before returning, then update UI on the main thread.
+    [ip loadFileRepresentationForTypeIdentifier:typeId
+                              completionHandler:^(NSURL *url, NSError *loadErr) {
+        if (!url) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self alert:@"Could not load from Photos"
+                    message:loadErr.localizedDescription ?: @"no file representation"];
+            });
+            return;
+        }
+        NSError *copyErr = nil;
+        NSString *ext = url.pathExtension.length ? url.pathExtension : @"mov";
+        NSString *name = suggested.length ? [suggested stringByAppendingPathExtension:ext]
+                                          : url.lastPathComponent;
+        NSString *dest = [self importClipAtURL:url suggestedName:name error:&copyErr];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (dest) { [self selectClip:dest]; [self refresh]; }
+            else [self alert:@"Could not import from Photos"
+                     message:copyErr.localizedDescription ?: @"copy failed"];
+        });
+    }];
+}
+
+#pragma mark Shared import
+
+// Copies src into DCIM (daemon-readable), overwriting a same-named existing import.
+// Returns the destination path, or nil (with *err set) on failure.
+- (NSString *)importClipAtURL:(NSURL *)src suggestedName:(NSString *)name error:(NSError **)err {
+    NSString *base = name.length ? name.lastPathComponent : src.lastPathComponent;
+    if (!base.length) base = @"vcam_import.mov";
+    NSString *dest = [kScanDir stringByAppendingPathComponent:base];
     NSFileManager *fm = NSFileManager.defaultManager;
     [fm removeItemAtPath:dest error:nil];
-    NSError *err = nil;
-    if (![fm copyItemAtURL:src toURL:[NSURL fileURLWithPath:dest] error:&err]) {
-        [self alert:@"Could not import file"
-            message:[NSString stringWithFormat:@"%@\n\nTried to copy into:\n%@",
-                      err.localizedDescription ?: @"copy failed", dest]];
-        return;
-    }
-    [self selectClip:dest];   // writes plist + posts reload
-    [self refresh];           // re-scan so it shows in the list, checked
+    if (![fm copyItemAtURL:src toURL:[NSURL fileURLWithPath:dest] error:err]) return nil;
+    return dest;
 }
 
 - (void)selectClip:(NSString *)path {

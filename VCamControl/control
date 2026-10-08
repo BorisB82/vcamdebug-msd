@@ -1,6 +1,6 @@
 Package: com.vcamplus.control
 Name: VCam Control
-Version: 0.8.5
+Version: 0.8.6
 Architecture: iphoneos-arm64
 Depends: firmware (>= 15.0)
 Description: Standalone controller for VCamdebug MediaServer: pick the source clip and toggle replacement via notifications
