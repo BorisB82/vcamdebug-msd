@@ -1,6 +1,6 @@
 Package: com.vcamplus.msd
 Name: VCamdebug MediaServer
-Version: 0.8.4
+Version: 0.8.5
 Architecture: iphoneos-arm64
 Depends: firmware (>= 15.0), mobilesubstrate
 Conflicts: com.local.vcameracrack
