@@ -1,5 +1,6 @@
 #import "VCCRootViewController.h"
 #import <notify.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 // Must match VCamCore.m in the tweak.
 static NSString *const kConfigPlist = @"/var/mobile/Media/DCIM/vcam_msd.plist";
@@ -11,7 +12,7 @@ static NSString *const kNoteDisable = @"com.vcamplus.msd.disable";
 static NSString *const kNoteToggle  = @"com.vcamplus.msd.toggle";
 static NSString *const kNoteReload  = @"com.vcamplus.msd.reload";
 
-@interface VCCRootViewController () <UITableViewDataSource, UITableViewDelegate>
+@interface VCCRootViewController () <UITableViewDataSource, UITableViewDelegate, UIDocumentPickerDelegate>
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSArray<NSString *> *clips;   // absolute paths
@@ -46,7 +47,7 @@ static NSString *const kNoteReload  = @"com.vcamplus.msd.reload";
 #pragma mark - Header (status + action buttons)
 
 - (UIView *)buildHeader {
-    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 150)];
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 210)];
 
     self.statusLabel = [[UILabel alloc] init];
     self.statusLabel.numberOfLines = 0;
@@ -64,8 +65,13 @@ static NSString *const kNoteReload  = @"com.vcamplus.msd.reload";
     buttons.spacing = 10;
     buttons.translatesAutoresizingMaskIntoConstraints = NO;
 
+    UIButton *pick = [self actionButton:@"Select File…" sel:@selector(tapSelectFile)
+                                  color:UIColor.systemBlueColor];
+    pick.translatesAutoresizingMaskIntoConstraints = NO;
+
     [header addSubview:self.statusLabel];
     [header addSubview:buttons];
+    [header addSubview:pick];
 
     [NSLayoutConstraint activateConstraints:@[
         [self.statusLabel.topAnchor constraintEqualToAnchor:header.topAnchor constant:12],
@@ -76,7 +82,12 @@ static NSString *const kNoteReload  = @"com.vcamplus.msd.reload";
         [buttons.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:20],
         [buttons.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-20],
         [buttons.heightAnchor constraintEqualToConstant:46],
-        [buttons.bottomAnchor constraintLessThanOrEqualToAnchor:header.bottomAnchor constant:-12],
+
+        [pick.topAnchor constraintEqualToAnchor:buttons.bottomAnchor constant:10],
+        [pick.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:20],
+        [pick.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-20],
+        [pick.heightAnchor constraintEqualToConstant:46],
+        [pick.bottomAnchor constraintLessThanOrEqualToAnchor:header.bottomAnchor constant:-12],
     ]];
     return header;
 }
@@ -97,6 +108,38 @@ static NSString *const kNoteReload  = @"com.vcamplus.msd.reload";
 - (void)tapEnable  { notify_post(kNoteEnable.UTF8String);  [self flash:@"Enabled"];  [self refreshStatusSoon]; }
 - (void)tapDisable { notify_post(kNoteDisable.UTF8String); [self flash:@"Disabled"]; [self refreshStatusSoon]; }
 - (void)tapToggle  { notify_post(kNoteToggle.UTF8String);  [self flash:@"Toggled"];  [self refreshStatusSoon]; }
+
+// Open the system document picker for video files. asCopy:YES hands us a temporary copy we
+// fully own (no security-scoped bookmarking), which we then relocate into DCIM so mediaserverd
+// can read it.
+- (void)tapSelectFile {
+    NSArray<UTType *> *types = @[ UTTypeMovie, UTTypeQuickTimeMovie, UTTypeMPEG4Movie, UTTypeVideo ];
+    UIDocumentPickerViewController *picker =
+        [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types asCopy:YES];
+    picker.delegate = self;
+    picker.allowsMultipleSelection = NO;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller
+didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    NSURL *src = urls.firstObject;
+    if (!src) return;
+
+    // Copy into DCIM (daemon-readable). Overwrite a same-named existing import.
+    NSString *dest = [kScanDir stringByAppendingPathComponent:src.lastPathComponent];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    [fm removeItemAtPath:dest error:nil];
+    NSError *err = nil;
+    if (![fm copyItemAtURL:src toURL:[NSURL fileURLWithPath:dest] error:&err]) {
+        [self alert:@"Could not import file"
+            message:[NSString stringWithFormat:@"%@\n\nTried to copy into:\n%@",
+                      err.localizedDescription ?: @"copy failed", dest]];
+        return;
+    }
+    [self selectClip:dest];   // writes plist + posts reload
+    [self refresh];           // re-scan so it shows in the list, checked
+}
 
 - (void)selectClip:(NSString *)path {
     NSDictionary *cfg = @{ @"source": path };
