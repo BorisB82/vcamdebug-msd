@@ -7,3 +7,7 @@ obj/
 # macOS / editor cruft
 .DS_Store
 *.swp
+
+# NDI SDK: keep only the gzipped arm64 lib + headers (see third_party/NDI/README.md)
+Install_NDI_SDK_v6_Apple.pkg
+third_party/NDI/lib/*.a

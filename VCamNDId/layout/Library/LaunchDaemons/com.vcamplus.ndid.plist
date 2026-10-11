@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.vcamplus.ndid</string>
+	<key>ProgramArguments</key>
+	<array>
+		<!-- RootHide rewrites this to the jbroot-prefixed path when it processes
+		     LaunchDaemons at jailbreak time. -->
+		<string>/usr/local/bin/vcamndid</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>StandardOutPath</key>
+	<string>/var/mobile/Media/DCIM/vcam_ndi_log.txt</string>
+	<key>StandardErrorPath</key>
+	<string>/var/mobile/Media/DCIM/vcam_ndi_log.txt</string>
+</dict>
+</plist>

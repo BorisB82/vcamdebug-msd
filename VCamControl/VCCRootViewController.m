@@ -13,6 +13,9 @@ static NSString *const kNoteDisable = @"com.vcamplus.msd.disable";
 static NSString *const kNoteToggle  = @"com.vcamplus.msd.toggle";
 static NSString *const kNoteReload  = @"com.vcamplus.msd.reload";
 
+// NDI daemon stats (milestone 1): read-only status surfaced in the header.
+static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.txt";
+
 @interface VCCRootViewController () <UITableViewDataSource, UITableViewDelegate,
                                      UIDocumentPickerDelegate, PHPickerViewControllerDelegate>
 @property (nonatomic, strong) UILabel *statusLabel;
@@ -49,7 +52,7 @@ static NSString *const kNoteReload  = @"com.vcamplus.msd.reload";
 #pragma mark - Header (status + action buttons)
 
 - (UIView *)buildHeader {
-    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 210)];
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 245)];
 
     self.statusLabel = [[UILabel alloc] init];
     self.statusLabel.numberOfLines = 0;
@@ -263,10 +266,22 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     NSString *src     = self.currentSource.lastPathComponent ?: @"(none)";
     BOOL statsSeen    = stats.length > 0;
 
+    // NDI daemon status (milestone 1): state=, frame=, fps= from its stats file.
+    NSString *ndi = [NSString stringWithContentsOfFile:kNDIStatsFile encoding:NSUTF8StringEncoding error:nil];
+    NSString *ndiLine;
+    if (ndi.length) {
+        ndiLine = [NSString stringWithFormat:@"NDI: %@  %@  %@fps",
+                   [self valueFor:@"state=" in:ndi] ?: @"?",
+                   [self valueFor:@"frame=" in:ndi] ?: @"",
+                   [self valueFor:@"fps=" in:ndi] ?: @"?"];
+    } else {
+        ndiLine = @"NDI: daemon not running";
+    }
+
     self.statusLabel.text = [NSString stringWithFormat:
-        @"tweak stats: %@\nenabled=%@  playerStarted=%@\nsource: %@",
+        @"tweak stats: %@\nenabled=%@  playerStarted=%@\nsource: %@\n%@",
         statsSeen ? @"present" : @"not found (open Camera once)",
-        enabled, player, src];
+        enabled, player, src, ndiLine];
 }
 
 // Pulls the token immediately after `key` up to whitespace from the stats text.
