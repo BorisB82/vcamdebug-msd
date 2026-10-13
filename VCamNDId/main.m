@@ -67,43 +67,24 @@ static void pub_set_enabled(VCamNDIPublisher *p, BOOL on) {
     if (p->hdr) p->hdr->enabled = on ? 1 : 0;
 }
 
-// Convert a packed UYVY (4:2:2, stride = w*2) frame to NV12 (4:2:0 '420v') into the next ring
-// slot, then publish it. UYVY bytes per 2 px: [U Y0 V Y1]. Y is depacked at full res; chroma
-// is averaged over each vertical pair of source rows (422 -> 420). This runs on the CONVERTER
-// thread (never the NDI capture thread), so a slow convert drops frames instead of stalling
-// capture and dropping the NDI connection. The consumer then gets a 420v source -> hardware
-// VideoToolbox scale.
+// Publish a packed UYVY (4:2:2, stride = w*2) frame into the next ring slot as-is. The byte
+// reorganize to NV12 was moved back out: doing it in the daemon process starved NDI's internal
+// network thread and dropped the connection. The consumer takes UYVY directly. This runs on the
+// CONVERTER thread and is just a memcpy, so it stays cheap. Kept decoupled from capture so a
+// stall drops frames, not the NDI link.
 static void pub_write_packed(VCamNDIPublisher *p, const uint8_t *src, uint32_t w, uint32_t h) {
     if (!p->hdr || !src) return;
     if (w < 2 || h < 2 || (w & 1u) || (h & 1u)) return;
     if (w > VCAMNDI_MAX_W || h > VCAMNDI_MAX_H) return;
-    uint32_t srcStride = w * 2u;
+    uint32_t rowBytes = w * 2u;
 
     uint32_t idx = p->writeIndex;
     uint8_t *slot = p->base + vcamndi_slot_offset(idx);
-    uint8_t *yPlane = slot;                                  // w*h, rowBytes = w
-    uint8_t *cbcr   = slot + vcamndi_y_bytes(w, h);          // w*(h/2), rowBytes = w
-
-    for (uint32_t y = 0; y < h; y++) {
-        const uint8_t *srow = src + (size_t)y * srcStride;
-        uint8_t *drow = yPlane + (size_t)y * w;
-        for (uint32_t x = 0; x < w; x++) drow[x] = srow[2u * x + 1u];
-    }
-    uint32_t hc = h / 2u, wc = w / 2u;
-    for (uint32_t jc = 0; jc < hc; jc++) {
-        const uint8_t *r0 = src + (size_t)(2u * jc)      * srcStride;
-        const uint8_t *r1 = src + (size_t)(2u * jc + 1u)  * srcStride;
-        uint8_t *drow = cbcr + (size_t)jc * w;
-        for (uint32_t xc = 0; xc < wc; xc++) {
-            uint32_t o = 4u * xc;
-            drow[2u * xc]      = (uint8_t)(((uint32_t)r0[o]      + r1[o])      >> 1);
-            drow[2u * xc + 1u] = (uint8_t)(((uint32_t)r0[o + 2u] + r1[o + 2u]) >> 1);
-        }
-    }
+    memcpy(slot, src, (size_t)rowBytes * h);                 // src is packed UYVY
 
     if (p->hdr->width != w || p->hdr->height != h || p->hdr->magic != VCAMNDI_MAGIC) {
         p->hdr->width = w; p->hdr->height = h;
-        p->hdr->rowBytes = w; p->hdr->fourcc = VCAMNDI_FOURCC_420V;
+        p->hdr->rowBytes = rowBytes; p->hdr->fourcc = VCAMNDI_FOURCC_2VUY;
         atomic_thread_fence(memory_order_release);
         p->hdr->configGen = p->hdr->configGen + 1;
         p->hdr->magic = VCAMNDI_MAGIC;
