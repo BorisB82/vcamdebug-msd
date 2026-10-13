@@ -18,6 +18,7 @@
 #import <fcntl.h>
 #import <unistd.h>
 #import <stdatomic.h>
+#import <pthread.h>
 #include "Processing.NDI.Lib.h"
 #include "VCamNDIShared.h"
 
@@ -66,45 +67,40 @@ static void pub_set_enabled(VCamNDIPublisher *p, BOOL on) {
     if (p->hdr) p->hdr->enabled = on ? 1 : 0;
 }
 
-// Convert one decoded UYVY (4:2:2) frame to NV12 (4:2:0 '420v') directly into the next ring
+// Convert a packed UYVY (4:2:2, stride = w*2) frame to NV12 (4:2:0 '420v') into the next ring
 // slot, then publish it. UYVY bytes per 2 px: [U Y0 V Y1]. Y is depacked at full res; chroma
-// is averaged over each vertical pair of source rows (422 -> 420). This byte reorganize is the
-// one unavoidable conversion, and it runs here on the daemon's cores (not on mediaserverd),
-// so the consumer's VideoToolbox transfer stays a hardware 420->420 scale.
-static void pub_write(VCamNDIPublisher *p, const NDIlib_video_frame_v2_t *vid) {
-    if (!p->hdr) return;
-    uint32_t w = (uint32_t)vid->xres, h = (uint32_t)vid->yres;
-    if (w < 2 || h < 2 || (w & 1u) || (h & 1u)) return;     // need even dims for 4:2:0
-    if (w > VCAMNDI_MAX_W || h > VCAMNDI_MAX_H) return;      // over cap: skip
-    int srcStride = vid->line_stride_in_bytes ? vid->line_stride_in_bytes : (int)(w * 2);
+// is averaged over each vertical pair of source rows (422 -> 420). This runs on the CONVERTER
+// thread (never the NDI capture thread), so a slow convert drops frames instead of stalling
+// capture and dropping the NDI connection. The consumer then gets a 420v source -> hardware
+// VideoToolbox scale.
+static void pub_write_packed(VCamNDIPublisher *p, const uint8_t *src, uint32_t w, uint32_t h) {
+    if (!p->hdr || !src) return;
+    if (w < 2 || h < 2 || (w & 1u) || (h & 1u)) return;
+    if (w > VCAMNDI_MAX_W || h > VCAMNDI_MAX_H) return;
+    uint32_t srcStride = w * 2u;
 
     uint32_t idx = p->writeIndex;
     uint8_t *slot = p->base + vcamndi_slot_offset(idx);
-    uint8_t *yPlane  = slot;                                 // w*h, rowBytes = w
-    uint8_t *cbcr    = slot + vcamndi_y_bytes(w, h);         // w*(h/2), rowBytes = w
-    const uint8_t *src = vid->p_data;
+    uint8_t *yPlane = slot;                                  // w*h, rowBytes = w
+    uint8_t *cbcr   = slot + vcamndi_y_bytes(w, h);          // w*(h/2), rowBytes = w
 
-    // Y plane: Y lives at odd byte offsets in UYVY.
     for (uint32_t y = 0; y < h; y++) {
         const uint8_t *srow = src + (size_t)y * srcStride;
         uint8_t *drow = yPlane + (size_t)y * w;
         for (uint32_t x = 0; x < w; x++) drow[x] = srow[2u * x + 1u];
     }
-
-    // CbCr plane: interleaved U,V, averaged across source row pairs.
     uint32_t hc = h / 2u, wc = w / 2u;
     for (uint32_t jc = 0; jc < hc; jc++) {
-        const uint8_t *r0 = src + (size_t)(2u * jc)     * srcStride;
-        const uint8_t *r1 = src + (size_t)(2u * jc + 1u) * srcStride;
+        const uint8_t *r0 = src + (size_t)(2u * jc)      * srcStride;
+        const uint8_t *r1 = src + (size_t)(2u * jc + 1u)  * srcStride;
         uint8_t *drow = cbcr + (size_t)jc * w;
         for (uint32_t xc = 0; xc < wc; xc++) {
-            uint32_t o = 4u * xc;                            // [U Y V Y] per 2 px
+            uint32_t o = 4u * xc;
             drow[2u * xc]      = (uint8_t)(((uint32_t)r0[o]      + r1[o])      >> 1);
             drow[2u * xc + 1u] = (uint8_t)(((uint32_t)r0[o + 2u] + r1[o + 2u]) >> 1);
         }
     }
 
-    // Geometry change → bump configGen so the consumer re-reads dimensions.
     if (p->hdr->width != w || p->hdr->height != h || p->hdr->magic != VCAMNDI_MAGIC) {
         p->hdr->width = w; p->hdr->height = h;
         p->hdr->rowBytes = w; p->hdr->fourcc = VCAMNDI_FOURCC_420V;
@@ -113,15 +109,62 @@ static void pub_write(VCamNDIPublisher *p, const NDIlib_video_frame_v2_t *vid) {
         p->hdr->magic = VCAMNDI_MAGIC;
     }
 
-    // Seqlock publish: odd = writing, even = stable.
     uint64_t seq = p->hdr->frameSeq;
-    p->hdr->frameSeq = seq + 1;                 // -> odd
+    p->hdr->frameSeq = seq + 1;                 // -> odd (write in progress)
     atomic_thread_fence(memory_order_release);
     p->hdr->currentIndex = idx;
     atomic_thread_fence(memory_order_release);
     p->hdr->frameSeq = seq + 2;                 // -> even, new frame id
 
     p->writeIndex = (idx + 1) % VCAMNDI_RING;
+}
+
+// ---- Capture/convert decoupling ------------------------------------------
+// The NDI capture thread must stay responsive or the sender drops the connection, so it only
+// does a fast packed copy of the latest frame into a hand-off buffer (latest wins; older
+// unconsumed frames are overwritten) and signals the converter. The converter thread does the
+// heavy UYVY->NV12 + publish. gPub is shared; only the converter touches the ring.
+static VCamNDIPublisher gPub;
+static pthread_mutex_t  gRawLock = PTHREAD_MUTEX_INITIALIZER;
+static dispatch_semaphore_t gRawSignal;
+static uint8_t  *gRawBuf = NULL;       // packed UYVY, capacity VCAMNDI_SLOT_BYTES
+static uint32_t  gRawW = 0, gRawH = 0;
+static uint64_t  gRawSeq = 0;          // bumped on each new captured frame
+static volatile int gConverterRun = 1;
+
+// Capture thread: fast packed copy + signal. Returns quickly so capture_v2 is called again soon.
+static void handoff_raw(const NDIlib_video_frame_v2_t *vid) {
+    uint32_t w = (uint32_t)vid->xres, h = (uint32_t)vid->yres;
+    if (w < 2 || h < 2 || (w & 1u) || (h & 1u)) return;
+    if (w > VCAMNDI_MAX_W || h > VCAMNDI_MAX_H) return;
+    uint32_t dstStride = w * 2u;
+    int srcStride = vid->line_stride_in_bytes ? vid->line_stride_in_bytes : (int)dstStride;
+    const uint8_t *src = vid->p_data;
+    if (!src) return;
+
+    pthread_mutex_lock(&gRawLock);
+    for (uint32_t y = 0; y < h; y++)
+        memcpy(gRawBuf + (size_t)y * dstStride, src + (size_t)y * srcStride, dstStride);
+    gRawW = w; gRawH = h; gRawSeq++;
+    pthread_mutex_unlock(&gRawLock);
+    dispatch_semaphore_signal(gRawSignal);
+}
+
+static void *converter_main(void *arg) {
+    uint8_t *local = malloc(VCAMNDI_SLOT_BYTES);
+    uint64_t lastSeq = 0;
+    while (gConverterRun) {
+        dispatch_semaphore_wait(gRawSignal, dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC));
+        uint32_t w = 0, h = 0;
+        pthread_mutex_lock(&gRawLock);
+        if (gRawSeq == lastSeq || !local) { pthread_mutex_unlock(&gRawLock); continue; }
+        lastSeq = gRawSeq; w = gRawW; h = gRawH;
+        memcpy(local, gRawBuf, (size_t)w * h * 2u);      // snapshot packed UYVY
+        pthread_mutex_unlock(&gRawLock);
+        pub_write_packed(&gPub, local, w, h);
+    }
+    if (local) free(local);
+    return NULL;
 }
 
 
@@ -209,9 +252,23 @@ int main(int argc, char *argv[]) {
             [NSThread sleepForTimeInterval:30]; return 1;
         }
 
-        VCamNDIPublisher pub;
-        BOOL pubOK = pub_open(&pub);
+        BOOL pubOK = pub_open(&gPub);
         if (!pubOK) NSLog(@"[vcam-ndi] continuing without shm publish");
+
+        // Start the converter thread + hand-off buffer (keeps the capture thread tight).
+        pthread_t convThread = 0;
+        BOOL convOK = NO;
+        if (pubOK) {
+            gRawBuf = malloc(VCAMNDI_SLOT_BYTES);
+            gRawSignal = dispatch_semaphore_create(0);
+            if (gRawBuf && gRawSignal &&
+                pthread_create(&convThread, NULL, converter_main, NULL) == 0) {
+                convOK = YES;
+            } else {
+                NSLog(@"[vcam-ndi] converter thread start failed; no shm publish");
+                pubOK = NO;
+            }
+        }
 
         int token;
         notify_register_dispatch(kNoteReload, &token,
@@ -235,7 +292,7 @@ int main(int argc, char *argv[]) {
                 VCamNDIConfig cfg = readConfig();
 
                 if (!cfg.enabled) {
-                    if (pubOK) pub_set_enabled(&pub, NO);
+                    if (pubOK) pub_set_enabled(&gPub, NO);
                     writeStats(@"disabled", nil, 0, 0, 0, 0.0, framesTotal);
                     for (int i = 0; i < 10 && !gReload; i++) [NSThread sleepForTimeInterval:0.1];
                     continue;
@@ -312,11 +369,13 @@ int main(int argc, char *argv[]) {
                                 if (gap > maxGapMs) maxGapMs = gap;
                             }
                             lastArrival = nowA;
-                            // Publish UYVY frames to the tweak. NDI "fastest" on SDR is UYVY;
-                            // other FourCCs (e.g. P216/BGRA) aren't bridged this milestone.
+                            // Hand the frame to the converter thread (fast copy) and free the NDI
+                            // frame immediately so capture_v2 is called again promptly — this keeps
+                            // the NDI connection alive even when conversion is slow. NDI "fastest"
+                            // on SDR is UYVY; other FourCCs aren't bridged this milestone.
                             if (pubOK && vid.FourCC == NDIlib_FourCC_type_UYVY) {
-                                pub_set_enabled(&pub, YES);
-                                pub_write(&pub, &vid);
+                                pub_set_enabled(&gPub, YES);
+                                handoff_raw(&vid);
                             }
                             NDIlib_recv_free_video_v2(recv, &vid);   // free immediately
                         } else if (type == NDIlib_frame_type_error) {
@@ -350,7 +409,7 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                if (pubOK) pub_set_enabled(&pub, NO);
+                if (pubOK) pub_set_enabled(&gPub, NO);
                 NDIlib_recv_destroy(recv);
             }
         }
