@@ -1,6 +1,6 @@
 Package: com.vcamplus.ndid
 Name: VCam NDI Daemon
-Version: 0.7.3
+Version: 0.7.4
 Architecture: iphoneos-arm64
 Depends: firmware (>= 15.0)
 Description: NDI receiver daemon for VCamdebug MediaServer (milestone 1: receive + stats, no mediaserverd bridge yet)
