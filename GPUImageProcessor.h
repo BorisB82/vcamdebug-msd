@@ -12,6 +12,9 @@ NS_ASSUME_NONNULL_BEGIN
                srcID:(uint64_t)srcID
                 into:(CVPixelBufferRef)dst;
 
+// Rotation applied during the transfer, in degrees clockwise: 0, 90, 180, or 270.
+- (void)setRotationDegrees:(int)degrees;
+
 - (uint64_t)vtCallCount;
 - (uint64_t)vtTotalNs;
 - (uint64_t)vtMaxNs;

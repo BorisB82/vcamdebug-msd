@@ -1,183 +1,111 @@
-// VTPixelTransferSession-based converter with a per-(width,height,format) CVPixelBuffer cache. A
-// geometry's cached frame is rebuilt only when the source frame id changes (VT scale/convert,
-// ScalingMode=CropSourceToCleanAperture, RealTime=true); the per-emit fast path is a CPU memcpy from
-// cache into the destination. No rotation/orientation handling.
+// GPU scale+convert+rotate using a Metal-backed CIContext. Replaces the old
+// VTPixelTransferSession path, which ran the 1080->2304 scale on the CPU (~12ms/frame on the
+// A11) regardless of pixel format. Core Image renders on the GPU, so the mediaserverd emit
+// thread stays cheap (which also removes the CPU contention that was starving the NDI daemon's
+// receive). Source is BGRA (from the mp4 decoder, or NDIShmSource's UYVY->BGRA); destination is
+// the camera's buffer (e.g. 420v) — CIContext handles the RGB->YUV + scale, and rotation is a
+// free orientation transform in the same pass.
 
 #import "GPUImageProcessor.h"
-#import <VideoToolbox/VideoToolbox.h>
+#import <CoreImage/CoreImage.h>
+#import <Metal/Metal.h>
 #import <mach/mach_time.h>
 #import <stdatomic.h>
-#import <dlfcn.h>
-#import <string.h>
-
-static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) {
-    if (CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return NO;
-    if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) {
-        CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-        return NO;
-    }
-    BOOL planar = CVPixelBufferIsPlanar(src);
-    if (!planar) {
-        const uint8_t *sp = CVPixelBufferGetBaseAddress(src);
-        uint8_t *dp = CVPixelBufferGetBaseAddress(dst);
-        size_t ss = CVPixelBufferGetBytesPerRow(src);
-        size_t ds = CVPixelBufferGetBytesPerRow(dst);
-        size_t h  = CVPixelBufferGetHeight(src);
-        size_t copy = ss < ds ? ss : ds;
-        if (sp && dp) for (size_t y = 0; y < h; y++) memcpy(dp + y*ds, sp + y*ss, copy);
-    } else {
-        size_t np = CVPixelBufferGetPlaneCount(src);
-        for (size_t p = 0; p < np; p++) {
-            const uint8_t *sp = CVPixelBufferGetBaseAddressOfPlane(src, p);
-            uint8_t *dp = CVPixelBufferGetBaseAddressOfPlane(dst, p);
-            size_t ss = CVPixelBufferGetBytesPerRowOfPlane(src, p);
-            size_t ds = CVPixelBufferGetBytesPerRowOfPlane(dst, p);
-            size_t h  = CVPixelBufferGetHeightOfPlane(src, p);
-            size_t copy = ss < ds ? ss : ds;
-            if (sp && dp) for (size_t y = 0; y < h; y++) memcpy(dp + y*ds, sp + y*ss, copy);
-        }
-    }
-    CVPixelBufferUnlockBaseAddress(dst, 0);
-    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-    return YES;
-}
-
-@interface VCamCacheEntry : NSObject {
-@public
-    CVPixelBufferRef _cached;
-    uint64_t _srcID;
-    size_t _w;
-    size_t _h;
-    OSType _fmt;
-}
-@end
-@implementation VCamCacheEntry
-- (void)dealloc { if (_cached) CFRelease(_cached); }
-@end
 
 @implementation GPUImageProcessor {
-    VTPixelTransferSessionRef _session;
-    NSRecursiveLock *_lock;
+    id<MTLDevice> _device;
+    CIContext *_ci;
+    CGColorSpaceRef _cs;
     mach_timebase_info_data_t _tb;
 
-    NSMutableDictionary<NSString *, VCamCacheEntry *> *_caches;
+    _Atomic int _rotation;        // 0/90/180/270 (clockwise)
 
-    _Atomic uint64_t _vtCount;
-    _Atomic uint64_t _vtTotalNs;
-    _Atomic uint64_t _vtMaxNs;
-    _Atomic uint64_t _cacheHits;
-    _Atomic uint64_t _cacheRebuilds;
-    _Atomic uint64_t _cacheRebuildTotalNs;
-    _Atomic int      _lastFailStatus;
+    _Atomic uint64_t _renderCount;
+    _Atomic uint64_t _renderTotalNs;
+    _Atomic uint64_t _renderMaxNs;
+    _Atomic uint64_t _failCount;
 }
 
 - (instancetype)init {
     if ((self = [super init])) {
-        _lock = [NSRecursiveLock new];
-        _caches = [NSMutableDictionary new];
         mach_timebase_info(&_tb);
-        OSStatus s = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_session);
-        if (s != noErr || !_session) {
-            NSLog(@"[vcam-msd] VTPixelTransferSessionCreate failed: %d", (int)s);
-            _session = NULL;
-            return self;
-        }
-        CFStringRef *pRT  = (CFStringRef *)dlsym(RTLD_DEFAULT, "kVTPixelTransferPropertyKey_RealTime");
-        CFStringRef *pSM  = (CFStringRef *)dlsym(RTLD_DEFAULT, "kVTPixelTransferPropertyKey_ScalingMode");
-        CFStringRef *pCrop= (CFStringRef *)dlsym(RTLD_DEFAULT, "kVTScalingMode_CropSourceToCleanAperture");
-        if (pRT && *pRT) VTSessionSetProperty(_session, *pRT, kCFBooleanTrue);
-        if (pSM && *pSM && pCrop && *pCrop) VTSessionSetProperty(_session, *pSM, *pCrop);
+        _cs = CGColorSpaceCreateDeviceRGB();
+        _device = MTLCreateSystemDefaultDevice();
+        // No working color space => no implicit color management overhead; we want a direct
+        // scale + matrix convert. (Color can be retuned here without affecting stability.)
+        NSDictionary *opts = @{ kCIContextWorkingColorSpace : [NSNull null],
+                                kCIContextOutputColorSpace  : [NSNull null] };
+        _ci = _device ? [CIContext contextWithMTLDevice:_device options:opts]
+                      : [CIContext contextWithOptions:opts];
+        if (!_ci) NSLog(@"[vcam-msd] CIContext create failed");
+        else NSLog(@"[vcam-msd] CIContext ready (metal=%d)", _device != nil);
     }
     return self;
 }
 
 - (void)dealloc {
-    if (_session) {
-        VTPixelTransferSessionInvalidate(_session);
-        CFRelease(_session);
-        _session = NULL;
-    }
+    if (_cs) CGColorSpaceRelease(_cs);
+}
+
+- (void)setRotationDegrees:(int)degrees {
+    int r = ((degrees % 360) + 360) % 360;
+    atomic_store_explicit(&_rotation, r, memory_order_relaxed);
 }
 
 - (BOOL)transferFrom:(CVPixelBufferRef)src
                srcID:(uint64_t)srcID
                 into:(CVPixelBufferRef)dst {
-    if (!src || !dst || !_session) return NO;
-
-    size_t dstW = CVPixelBufferGetWidth(dst);
-    size_t dstH = CVPixelBufferGetHeight(dst);
-    OSType dstFmt = CVPixelBufferGetPixelFormatType(dst);
+    (void)srcID;
+    if (!src || !dst || !_ci) return NO;
 
     uint64_t t0 = mach_absolute_time();
 
-    [_lock lock];
-    NSString *key = [NSString stringWithFormat:@"%zu_%zu_%u", dstW, dstH, (unsigned)dstFmt];
-    VCamCacheEntry *entry = _caches[key];
+    size_t dstW = CVPixelBufferGetWidth(dst);
+    size_t dstH = CVPixelBufferGetHeight(dst);
 
-    if (!entry) {
+    CIImage *img = [CIImage imageWithCVPixelBuffer:src];
+    if (!img) { atomic_fetch_add_explicit(&_failCount, 1, memory_order_relaxed); return NO; }
 
-        NSDictionary *attrs = @{
-            (NSString *)kCVPixelBufferPixelFormatTypeKey: @(dstFmt),
-            (NSString *)kCVPixelBufferWidthKey:           @(dstW),
-            (NSString *)kCVPixelBufferHeightKey:          @(dstH),
-            (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
-        };
-        CVPixelBufferRef pb = NULL;
-        CVReturn r = CVPixelBufferCreate(kCFAllocatorDefault, dstW, dstH, dstFmt,
-                                         (__bridge CFDictionaryRef)attrs, &pb);
-        if (r != kCVReturnSuccess || !pb) { [_lock unlock]; return NO; }
-        entry = [VCamCacheEntry new];
-        entry->_cached = pb;
-        entry->_w = dstW; entry->_h = dstH; entry->_fmt = dstFmt;
-        entry->_srcID = 0;
-        _caches[key] = entry;
+    // Rotation (clockwise) via a baked orientation.
+    int rot = atomic_load_explicit(&_rotation, memory_order_relaxed);
+    CGImagePropertyOrientation o = kCGImagePropertyOrientationUp;
+    if      (rot == 90)  o = kCGImagePropertyOrientationRight;
+    else if (rot == 180) o = kCGImagePropertyOrientationDown;
+    else if (rot == 270) o = kCGImagePropertyOrientationLeft;
+    if (o != kCGImagePropertyOrientationUp) img = [img imageByApplyingCGOrientation:o];
+
+    // Normalize to origin, then stretch to fill the destination.
+    CGRect e = img.extent;
+    if (e.origin.x != 0 || e.origin.y != 0)
+        img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(-e.origin.x, -e.origin.y)];
+    e = img.extent;
+    if (e.size.width < 1 || e.size.height < 1) {
+        atomic_fetch_add_explicit(&_failCount, 1, memory_order_relaxed); return NO;
     }
+    CGFloat sx = (CGFloat)dstW / e.size.width;
+    CGFloat sy = (CGFloat)dstH / e.size.height;
+    img = [img imageByApplyingTransform:CGAffineTransformMakeScale(sx, sy)];
 
-    OSStatus rebuildStatus = noErr;
-    if (entry->_srcID != srcID) {
+    [_ci render:img toCVPixelBuffer:dst bounds:CGRectMake(0, 0, dstW, dstH) colorSpace:_cs];
 
-        uint64_t r0 = mach_absolute_time();
-        rebuildStatus = VTPixelTransferSessionTransferImage(_session, src, entry->_cached);
-        uint64_t r1 = mach_absolute_time();
-        if (rebuildStatus == noErr) {
-            entry->_srcID = srcID;
-            uint64_t dtNs = (r1 - r0) * _tb.numer / _tb.denom;
-            atomic_fetch_add_explicit(&_cacheRebuilds, 1, memory_order_relaxed);
-            atomic_fetch_add_explicit(&_cacheRebuildTotalNs, dtNs, memory_order_relaxed);
-        } else {
-            atomic_store_explicit(&_lastFailStatus, (int)rebuildStatus, memory_order_relaxed);
-        }
-    } else {
-        atomic_fetch_add_explicit(&_cacheHits, 1, memory_order_relaxed);
-    }
-
-    CVPixelBufferRef cachedSnap = entry->_cached;
-    if (rebuildStatus == noErr) CFRetain(cachedSnap);
-    [_lock unlock];
-
-    BOOL ok = NO;
-    if (rebuildStatus == noErr) {
-        ok = vcam_cpuCopyPixelBuffer(cachedSnap, dst);
-        CFRelease(cachedSnap);
-    }
-
-    uint64_t t1 = mach_absolute_time();
-    uint64_t dtNs = (t1 - t0) * _tb.numer / _tb.denom;
-    atomic_fetch_add_explicit(&_vtCount,   1,    memory_order_relaxed);
-    atomic_fetch_add_explicit(&_vtTotalNs, dtNs, memory_order_relaxed);
-    uint64_t prev = atomic_load_explicit(&_vtMaxNs, memory_order_relaxed);
+    uint64_t dtNs = (mach_absolute_time() - t0) * _tb.numer / _tb.denom;
+    atomic_fetch_add_explicit(&_renderCount, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&_renderTotalNs, dtNs, memory_order_relaxed);
+    uint64_t prev = atomic_load_explicit(&_renderMaxNs, memory_order_relaxed);
     while (dtNs > prev &&
-           !atomic_compare_exchange_weak_explicit(&_vtMaxNs, &prev, dtNs,
+           !atomic_compare_exchange_weak_explicit(&_renderMaxNs, &prev, dtNs,
                memory_order_relaxed, memory_order_relaxed)) {}
-    return ok;
+    return YES;
 }
 
-- (uint64_t)vtCallCount         { return atomic_load_explicit(&_vtCount,            memory_order_relaxed); }
-- (uint64_t)vtTotalNs           { return atomic_load_explicit(&_vtTotalNs,          memory_order_relaxed); }
-- (uint64_t)vtMaxNs             { return atomic_load_explicit(&_vtMaxNs,            memory_order_relaxed); }
-- (uint64_t)cacheHitCount       { return atomic_load_explicit(&_cacheHits,          memory_order_relaxed); }
-- (uint64_t)cacheRebuildCount   { return atomic_load_explicit(&_cacheRebuilds,      memory_order_relaxed); }
-- (uint64_t)cacheRebuildTotalNs { return atomic_load_explicit(&_cacheRebuildTotalNs,memory_order_relaxed); }
-- (int)lastFailStatus           { return atomic_load_explicit(&_lastFailStatus,      memory_order_relaxed); }
+// Stats accessors keep their names so VCamCore's dump still compiles; they now report the GPU
+// render instead of the old VT/cache path. rebuildMean (cacheRebuild*) == GPU render mean.
+- (uint64_t)vtCallCount         { return atomic_load_explicit(&_renderCount,   memory_order_relaxed); }
+- (uint64_t)vtTotalNs           { return atomic_load_explicit(&_renderTotalNs, memory_order_relaxed); }
+- (uint64_t)vtMaxNs             { return atomic_load_explicit(&_renderMaxNs,   memory_order_relaxed); }
+- (uint64_t)cacheHitCount       { return 0; }
+- (uint64_t)cacheRebuildCount   { return atomic_load_explicit(&_renderCount,   memory_order_relaxed); }
+- (uint64_t)cacheRebuildTotalNs { return atomic_load_explicit(&_renderTotalNs, memory_order_relaxed); }
+- (int)lastFailStatus           { return (int)atomic_load_explicit(&_failCount, memory_order_relaxed); }
 
 @end

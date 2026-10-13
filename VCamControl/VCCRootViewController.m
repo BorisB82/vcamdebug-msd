@@ -35,6 +35,9 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
     self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
                                                       target:self action:@selector(refresh)];
+    self.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"Rotate 0°" style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(tapRotate)];
 
     self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -249,6 +252,16 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     [self.tableView reloadData];
 }
 
+// Cycle rotation 0 → 90 → 180 → 270 → 0, write it, and reload the tweak.
+- (void)tapRotate {
+    NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:kConfigPlist];
+    NSInteger deg = (([cfg[@"rotation"] integerValue] / 90 + 1) % 4) * 90;
+    if (![self writeConfigMerging:@{ @"rotation": @(deg) }]) return;
+    self.navigationItem.leftBarButtonItem.title = [NSString stringWithFormat:@"Rotate %ld°", (long)deg];
+    notify_post(kNoteReload.UTF8String);
+    [self flash:[NSString stringWithFormat:@"Rotation → %ld°", (long)deg]];
+}
+
 // File clip (0) vs NDI stream (1). Writes "mode" and reloads the tweak.
 - (void)modeChanged:(UISegmentedControl *)sender {
     BOOL ndi = (sender.selectedSegmentIndex == 1);
@@ -265,6 +278,8 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     self.currentSource = [cfg[@"source"] isKindOfClass:NSString.class] ? cfg[@"source"] : nil;
     BOOL ndi = [[cfg[@"mode"] description] caseInsensitiveCompare:@"ndi"] == NSOrderedSame;
     self.modeControl.selectedSegmentIndex = ndi ? 1 : 0;
+    self.navigationItem.leftBarButtonItem.title =
+        [NSString stringWithFormat:@"Rotate %ld°", (long)([cfg[@"rotation"] integerValue])];
 
     // Scan for candidate clips.
     NSMutableArray *found = [NSMutableArray array];

@@ -155,6 +155,10 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
 // Runs on _ctrlQueue. Picks the source for the current mode, swaps it in if changed, and
 // starts/stops it to match the enabled gate.
 - (void)reconfigure {
+    // Rotation (degrees clockwise) from the shared plist, applied in the GPU transfer.
+    NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:kVCamConfigPlist];
+    [_gpuProcessor setRotationDegrees:[cfg[@"rotation"] intValue]];
+
     BOOL ndi = [self configuredNDIMode];
     _ndiMode = ndi;
     id<VCamFrameSource> desired = ndi ? (id<VCamFrameSource>)_ndiSource
