@@ -18,6 +18,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (uint64_t)cacheHitCount;
 - (uint64_t)cacheRebuildCount;
 - (uint64_t)cacheRebuildTotalNs;
+- (int)lastFailStatus;   // last non-noErr VTPixelTransfer status (0 = none)
 
 @end
 

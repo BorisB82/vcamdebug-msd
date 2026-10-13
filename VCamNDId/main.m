@@ -66,25 +66,48 @@ static void pub_set_enabled(VCamNDIPublisher *p, BOOL on) {
     if (p->hdr) p->hdr->enabled = on ? 1 : 0;
 }
 
-// Copy one decoded UYVY frame into the next ring slot and publish it.
+// Convert one decoded UYVY (4:2:2) frame to NV12 (4:2:0 '420v') directly into the next ring
+// slot, then publish it. UYVY bytes per 2 px: [U Y0 V Y1]. Y is depacked at full res; chroma
+// is averaged over each vertical pair of source rows (422 -> 420). This byte reorganize is the
+// one unavoidable conversion, and it runs here on the daemon's cores (not on mediaserverd),
+// so the consumer's VideoToolbox transfer stays a hardware 420->420 scale.
 static void pub_write(VCamNDIPublisher *p, const NDIlib_video_frame_v2_t *vid) {
     if (!p->hdr) return;
     uint32_t w = (uint32_t)vid->xres, h = (uint32_t)vid->yres;
-    if (w == 0 || h == 0 || w > VCAMNDI_MAX_W || h > VCAMNDI_MAX_H) return; // over cap: skip
-    uint32_t rowBytes = w * 2;                 // packed UYVY destination
-    int srcStride = vid->line_stride_in_bytes ? vid->line_stride_in_bytes : (int)rowBytes;
+    if (w < 2 || h < 2 || (w & 1u) || (h & 1u)) return;     // need even dims for 4:2:0
+    if (w > VCAMNDI_MAX_W || h > VCAMNDI_MAX_H) return;      // over cap: skip
+    int srcStride = vid->line_stride_in_bytes ? vid->line_stride_in_bytes : (int)(w * 2);
 
     uint32_t idx = p->writeIndex;
     uint8_t *slot = p->base + vcamndi_slot_offset(idx);
-
+    uint8_t *yPlane  = slot;                                 // w*h, rowBytes = w
+    uint8_t *cbcr    = slot + vcamndi_y_bytes(w, h);         // w*(h/2), rowBytes = w
     const uint8_t *src = vid->p_data;
-    for (uint32_t y = 0; y < h; y++)
-        memcpy(slot + (size_t)y * rowBytes, src + (size_t)y * srcStride, rowBytes);
+
+    // Y plane: Y lives at odd byte offsets in UYVY.
+    for (uint32_t y = 0; y < h; y++) {
+        const uint8_t *srow = src + (size_t)y * srcStride;
+        uint8_t *drow = yPlane + (size_t)y * w;
+        for (uint32_t x = 0; x < w; x++) drow[x] = srow[2u * x + 1u];
+    }
+
+    // CbCr plane: interleaved U,V, averaged across source row pairs.
+    uint32_t hc = h / 2u, wc = w / 2u;
+    for (uint32_t jc = 0; jc < hc; jc++) {
+        const uint8_t *r0 = src + (size_t)(2u * jc)     * srcStride;
+        const uint8_t *r1 = src + (size_t)(2u * jc + 1u) * srcStride;
+        uint8_t *drow = cbcr + (size_t)jc * w;
+        for (uint32_t xc = 0; xc < wc; xc++) {
+            uint32_t o = 4u * xc;                            // [U Y V Y] per 2 px
+            drow[2u * xc]      = (uint8_t)(((uint32_t)r0[o]      + r1[o])      >> 1);
+            drow[2u * xc + 1u] = (uint8_t)(((uint32_t)r0[o + 2u] + r1[o + 2u]) >> 1);
+        }
+    }
 
     // Geometry change → bump configGen so the consumer re-reads dimensions.
     if (p->hdr->width != w || p->hdr->height != h || p->hdr->magic != VCAMNDI_MAGIC) {
         p->hdr->width = w; p->hdr->height = h;
-        p->hdr->rowBytes = rowBytes; p->hdr->fourcc = VCAMNDI_FOURCC_2VUY;
+        p->hdr->rowBytes = w; p->hdr->fourcc = VCAMNDI_FOURCC_420V;
         atomic_thread_fence(memory_order_release);
         p->hdr->configGen = p->hdr->configGen + 1;
         p->hdr->magic = VCAMNDI_MAGIC;

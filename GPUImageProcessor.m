@@ -68,6 +68,7 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
     _Atomic uint64_t _cacheHits;
     _Atomic uint64_t _cacheRebuilds;
     _Atomic uint64_t _cacheRebuildTotalNs;
+    _Atomic int      _lastFailStatus;
 }
 
 - (instancetype)init {
@@ -143,6 +144,8 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
             uint64_t dtNs = (r1 - r0) * _tb.numer / _tb.denom;
             atomic_fetch_add_explicit(&_cacheRebuilds, 1, memory_order_relaxed);
             atomic_fetch_add_explicit(&_cacheRebuildTotalNs, dtNs, memory_order_relaxed);
+        } else {
+            atomic_store_explicit(&_lastFailStatus, (int)rebuildStatus, memory_order_relaxed);
         }
     } else {
         atomic_fetch_add_explicit(&_cacheHits, 1, memory_order_relaxed);
@@ -175,5 +178,6 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
 - (uint64_t)cacheHitCount       { return atomic_load_explicit(&_cacheHits,          memory_order_relaxed); }
 - (uint64_t)cacheRebuildCount   { return atomic_load_explicit(&_cacheRebuilds,      memory_order_relaxed); }
 - (uint64_t)cacheRebuildTotalNs { return atomic_load_explicit(&_cacheRebuildTotalNs,memory_order_relaxed); }
+- (int)lastFailStatus           { return atomic_load_explicit(&_lastFailStatus,      memory_order_relaxed); }
 
 @end

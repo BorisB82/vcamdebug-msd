@@ -60,7 +60,7 @@
     return (seq & 1ULL) ? 0 : seq;   // odd = write in progress
 }
 
-// Caller holds _lock.
+// Caller holds _lock. NV12 / 420v biplanar to match the daemon's published format.
 - (BOOL)ensurePoolW:(uint32_t)w h:(uint32_t)h {
     if (_w == w && _h == h && _pool[0]) return YES;
     for (int i = 0; i < (int)VCAMNDI_RING; i++) { if (_pool[i]) { CFRelease(_pool[i]); _pool[i] = NULL; } }
@@ -69,7 +69,7 @@
     for (int i = 0; i < (int)VCAMNDI_RING; i++) {
         CVPixelBufferRef pb = NULL;
         CVReturn r = CVPixelBufferCreate(kCFAllocatorDefault, w, h,
-                                         kCVPixelFormatType_422YpCbCr8,
+                                         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                                          (__bridge CFDictionaryRef)attrs, &pb);
         if (r != kCVReturnSuccess || !pb) {
             NSLog(@"[vcam-msd] ndi pool create failed (%d)", r);
@@ -89,21 +89,28 @@
         if (s1 & 1ULL) continue;                 // mid-write, retry
         atomic_thread_fence(memory_order_acquire);
         uint32_t idx = h->currentIndex;
-        uint32_t w = h->width, hh = h->height, rb = h->rowBytes;
-        if (idx >= VCAMNDI_RING || w == 0 || hh == 0 || rb == 0) return NULL;
-        if (rb * (size_t)hh > VCAMNDI_SLOT_BYTES) return NULL;   // sanity
+        uint32_t w = h->width, hh = h->height;
+        if (idx >= VCAMNDI_RING || w < 2 || hh < 2 || (w & 1u) || (hh & 1u)) return NULL;
+        if (vcamndi_y_bytes(w, hh) + vcamndi_cbcr_bytes(w, hh) > VCAMNDI_SLOT_BYTES) return NULL;
 
         os_unfair_lock_lock(&_lock);
         if (![self ensurePoolW:w h:hh]) { os_unfair_lock_unlock(&_lock); return NULL; }
         CVPixelBufferRef dst = _pool[_poolIdx];
         const uint8_t *slot = _base + vcamndi_slot_offset(idx);
+        const uint8_t *srcY    = slot;                              // w*hh, rowBytes = w
+        const uint8_t *srcCbCr = slot + vcamndi_y_bytes(w, hh);     // w*(hh/2), rowBytes = w
 
         CVPixelBufferLockBaseAddress(dst, 0);
-        uint8_t *dstBase = CVPixelBufferGetBaseAddress(dst);
-        size_t dstStride = CVPixelBufferGetBytesPerRow(dst);
-        size_t copyBytes = rb < dstStride ? rb : dstStride;
+        // Plane 0: Y
+        uint8_t *dY = CVPixelBufferGetBaseAddressOfPlane(dst, 0);
+        size_t dYStride = CVPixelBufferGetBytesPerRowOfPlane(dst, 0);
         for (uint32_t y = 0; y < hh; y++)
-            memcpy(dstBase + (size_t)y * dstStride, slot + (size_t)y * rb, copyBytes);
+            memcpy(dY + (size_t)y * dYStride, srcY + (size_t)y * w, w);
+        // Plane 1: interleaved CbCr (half height)
+        uint8_t *dC = CVPixelBufferGetBaseAddressOfPlane(dst, 1);
+        size_t dCStride = CVPixelBufferGetBytesPerRowOfPlane(dst, 1);
+        for (uint32_t j = 0; j < hh / 2u; j++)
+            memcpy(dC + (size_t)j * dCStride, srcCbCr + (size_t)j * w, w);
         CVPixelBufferUnlockBaseAddress(dst, 0);
 
         atomic_thread_fence(memory_order_acquire);

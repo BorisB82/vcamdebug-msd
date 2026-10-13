@@ -239,7 +239,8 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
     [s appendFormat:@"  noSrc:         %llu\n", atomic_load(&_hitNoSrc)];
     [s appendFormat:@"  vtAttempt:     %llu\n", atomic_load(&_hitVTAttempt)];
     [s appendFormat:@"  vtSuccess:     %llu\n", atomic_load(&_hitVTSuccess)];
-    [s appendFormat:@"  vtFail:        %llu\n", atomic_load(&_hitVTFail)];
+    [s appendFormat:@"  vtFail:        %llu (lastStatus=%d)\n",
+        atomic_load(&_hitVTFail), [_gpuProcessor lastFailStatus]];
     [s appendFormat:@"\n--- VT latency (P0+cache: RealTime + CropMode + cached transfer) ---\n"];
     [s appendFormat:@"vtCount:        %llu  (every emit that called transferFrom)\n", vtCount];
     [s appendFormat:@"vtMeanUs:       %.1f µs  (overall, mixing fast and slow path)\n", vtMeanUs];
