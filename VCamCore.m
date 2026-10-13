@@ -71,6 +71,11 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
 
     _Atomic uint64_t _lastConsumedSrcID;
 
+    // For per-interval rate reporting in dumpStats.
+    double _lastDumpUptime;
+    uint64_t _lastHitSnap;
+    uint64_t _lastRebuildSnap;
+
     dispatch_source_t _statsTimer;
 }
 
@@ -194,11 +199,33 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
     double cacheHitRate = (cacheHits + cacheRebuilds) > 0
         ? 100.0 * cacheHits / (cacheHits + cacheRebuilds) : 0.0;
 
+    // Per-interval rates: emitFps = camera emits/sec through the hook; freshFps = how often
+    // the replacement image actually updates (new source frames = cache rebuilds). A low
+    // freshFps while enabled means the source is starving the consumer (cpu/network).
+    double upNow = NSProcessInfo.processInfo.systemUptime;
+    uint64_t hitNow = atomic_load(&_hitTotal);
+    double emitFps = 0.0, freshFps = 0.0;
+    if (_lastDumpUptime > 0.0) {
+        double dt = upNow - _lastDumpUptime;
+        if (dt > 0.0) {
+            emitFps  = (double)(hitNow - _lastHitSnap) / dt;
+            freshFps = (double)(cacheRebuilds - _lastRebuildSnap) / dt;
+        }
+    }
+    _lastDumpUptime = upNow; _lastHitSnap = hitNow; _lastRebuildSnap = cacheRebuilds;
+
     NSMutableString *s = [NSMutableString stringWithCapacity:1024];
-    [s appendFormat:@"=== vcam-msd v0.7 stats @ %@ ===\n",
+    [s appendFormat:@"=== vcam-msd stats @ %@ ===\n",
         [NSDateFormatter localizedStringFromDate:NSDate.date
                                        dateStyle:NSDateFormatterShortStyle
                                        timeStyle:NSDateFormatterMediumStyle]];
+    [s appendFormat:@"SUMMARY emitFps=%.1f freshFps=%.1f  (freshFps = real image update rate)\n",
+        emitFps, freshFps];
+    if (atomic_load(&_enabled)) {
+        [s appendFormat:@"VERDICT: %@\n", freshFps < 20.0
+            ? @"source STARVED — fresh frames not arriving fast enough (cpu/network)"
+            : @"source healthy"];
+    }
     [s appendFormat:@"playerStarted=%d enabled=%d\n", _playerStarted, atomic_load(&_enabled)];
     [s appendFormat:@"mode=%@ source=%@\n", _ndiMode ? @"ndi" : @"file", _ndiMode ? @"(ndi shm)" : _sourcePath];
     [s appendFormat:@"lastDst=%ux%u '%s' (0x%08x)\n", w, h, fcc, fmt];

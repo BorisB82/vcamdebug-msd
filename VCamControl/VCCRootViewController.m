@@ -317,10 +317,16 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
         ndiLine = @"NDI: daemon not running";
     }
 
+    NSString *emit  = [self valueFor:@"emitFps=" in:stats];
+    NSString *fresh = [self valueFor:@"freshFps=" in:stats];
+    NSString *rateLine = (emit || fresh)
+        ? [NSString stringWithFormat:@"\nemitFps=%@ freshFps=%@ (real update rate)", emit ?: @"?", fresh ?: @"?"]
+        : @"";
+
     self.statusLabel.text = [NSString stringWithFormat:
-        @"tweak stats: %@\nenabled=%@  playerStarted=%@\nsource: %@\n%@",
+        @"tweak: %@  enabled=%@  mode=%@%@\nsource: %@\n%@",
         statsSeen ? @"present" : @"not found (open Camera once)",
-        enabled, player, src, ndiLine];
+        enabled, [self valueFor:@"mode=" in:stats] ?: @"?", rateLine, src, ndiLine];
 }
 
 // Pulls the token immediately after `key` up to whitespace from the stats text.
