@@ -20,6 +20,9 @@ NS_ASSUME_NONNULL_BEGIN
 // Rotation applied during the render, in degrees clockwise: 0, 90, 180, or 270.
 - (void)setRotationDegrees:(int)degrees;
 
+// Diagnostic: per-geometry emit/render counts (which buffer sizes the pipeline emits).
+- (NSString *)geometryReport;
+
 - (uint64_t)vtCallCount;
 - (uint64_t)vtTotalNs;
 - (uint64_t)vtMaxNs;

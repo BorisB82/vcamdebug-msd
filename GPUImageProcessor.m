@@ -52,6 +52,8 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
     CVPixelBufferRef ready;     // latest fully-rendered (points into pool); not retained here
     uint64_t readySrcID;
     double lastSeen;            // uptime of last emit touch (to retire dead geometries)
+    uint64_t emits;             // how many times the emit path asked for this geometry
+    uint64_t renders;           // how many times we GPU-rendered it
 }
 @end
 @implementation VCamGeom
@@ -160,10 +162,25 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
                    memory_order_relaxed, memory_order_relaxed)) {}
 
         os_unfair_lock_lock(&_lock);
-        g->ready = buf; g->readySrcID = srcID;
+        g->ready = buf; g->readySrcID = srcID; g->renders++;
         g->poolIdx = (idx + 1) % VCAM_GEOM_POOL;   // next render uses a different slot
         os_unfair_lock_unlock(&_lock);
     }
+}
+
+// A one-line-per-geometry report of everything flowing through the hook, so we can see which
+// buffer sizes/formats the pipeline actually emits (and how often) vs which we render.
+- (NSString *)geometryReport {
+    NSMutableString *s = [NSMutableString stringWithString:@"--- dst geometries seen ---\n"];
+    os_unfair_lock_lock(&_lock);
+    [_geoms enumerateKeysAndObjectsUsingBlock:^(NSString *k, VCamGeom *g, BOOL *stop) {
+        char fcc[5] = {0};
+        fcc[0]=(g->fmt>>24)&0xff; fcc[1]=(g->fmt>>16)&0xff; fcc[2]=(g->fmt>>8)&0xff; fcc[3]=g->fmt&0xff;
+        [s appendFormat:@"%zux%zu '%s': emits=%llu renders=%llu\n",
+            g->w, g->h, fcc, g->emits, g->renders];
+    }];
+    os_unfair_lock_unlock(&_lock);
+    return s;
 }
 
 - (BOOL)copyLatestInto:(CVPixelBufferRef)dst {
@@ -176,6 +193,7 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
     VCamGeom *g = _geoms[key];
     if (!g) { g = [VCamGeom new]; g->w = w; g->h = h; g->fmt = fmt; _geoms[key] = g; }
     g->lastSeen = [self nowSec];
+    g->emits++;
     CVPixelBufferRef ready = g->ready;
     if (ready) CFRetain(ready);
     os_unfair_lock_unlock(&_lock);

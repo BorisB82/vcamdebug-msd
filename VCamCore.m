@@ -300,6 +300,8 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
         atomic_load(&gInstallSubclassHits)];
     [s appendFormat:@"emitHookEverFired:   %d  (1 if any hooked class's emit was actually called)\n",
         atomic_load(&gFirstClassReachedHook)];
+    [s appendString:@"\n"];
+    [s appendString:[_gpuProcessor geometryReport]];
     [s writeToFile:kVCamStatsFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
