@@ -77,6 +77,12 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
     uint64_t _lastRebuildSnap;
 
     dispatch_source_t _statsTimer;
+
+    // Off-emit-thread GPU render pump: pulls new source frames and renders them so the emit
+    // path only has to copy. Keeps the ~GPU-time render off mediaserverd's emit thread.
+    dispatch_queue_t _renderQueue;
+    dispatch_source_t _renderTimer;
+    uint64_t _lastRenderedID;
 }
 
 + (instancetype)shared {
@@ -107,8 +113,33 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
             @autoreleasepool { [weakSelf dumpStats]; }
         });
         dispatch_resume(_statsTimer);
+
+        // Render pump @ ~60 Hz: renders new source frames off the emit thread.
+        _renderQueue = dispatch_queue_create("com.vcamplus.msd.render", DISPATCH_QUEUE_SERIAL);
+        _renderTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _renderQueue);
+        dispatch_source_set_timer(_renderTimer, dispatch_time(DISPATCH_TIME_NOW, 0),
+                                  (uint64_t)(NSEC_PER_SEC / 60), 2 * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(_renderTimer, ^{
+            @autoreleasepool { [weakSelf renderTick]; }
+        });
+        dispatch_resume(_renderTimer);
     }
     return self;
+}
+
+// Runs on _renderQueue (NOT the emit thread). When enabled, grab the latest source frame and
+// GPU-render it into the ready buffers the emit path copies from.
+- (void)renderTick {
+    if (!atomic_load_explicit(&_enabled, memory_order_relaxed)) return;
+    id<VCamFrameSource> source = _activeSource;
+    if (!source) return;
+    uint64_t srcID = [source latestFrameID];
+    if (srcID == 0 || srcID == _lastRenderedID) return;
+    CVPixelBufferRef src = [source latestFrameRetained];
+    if (!src) return;
+    [_gpuProcessor renderSource:src srcID:srcID];
+    CFRelease(src);
+    _lastRenderedID = srcID;
 }
 
 // Reads the configured source path from kVCamConfigPlist ({"source": "/path/to/clip.mp4"}),
@@ -304,30 +335,15 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
         return NO;
     }
 
-    id<VCamFrameSource> source = _activeSource;
-    uint64_t srcID = [source latestFrameID];
-    if (srcID == 0) {
-        atomic_fetch_add_explicit(&_hitNoSrc, 1, memory_order_relaxed);
-        return NO;
-    }
-
-    CVPixelBufferRef srcFrame = [source latestFrameRetained];
-    if (!srcFrame) {
-        atomic_fetch_add_explicit(&_hitNoSrc, 1, memory_order_relaxed);
-        return NO;
-    }
-
+    // Emit hot path: copy the latest off-thread-rendered frame into the camera buffer. No render
+    // here — the GPU work happens on _renderQueue (renderTick), so this stays a quick memcpy.
     atomic_fetch_add_explicit(&_hitVTAttempt, 1, memory_order_relaxed);
-    BOOL ok = [_gpuProcessor transferFrom:srcFrame srcID:srcID into:dstPB];
-    CFRelease(srcFrame);
-    atomic_store_explicit(&_lastConsumedSrcID, srcID, memory_order_relaxed);
-    if (ok) {
-        atomic_fetch_add_explicit(&_hitVTSuccess, 1, memory_order_relaxed);
-        return YES;
-    } else {
-        atomic_fetch_add_explicit(&_hitVTFail, 1, memory_order_relaxed);
+    if (![_gpuProcessor copyLatestInto:dstPB]) {  // not rendered yet -> pass real camera through
+        atomic_fetch_add_explicit(&_hitNoSrc, 1, memory_order_relaxed);
         return NO;
     }
+    atomic_fetch_add_explicit(&_hitVTSuccess, 1, memory_order_relaxed);
+    return YES;
 }
 
 @end

@@ -1,39 +1,41 @@
-// GPU scale+convert+rotate using a Metal-backed CIContext, with a per-(geometry) frame cache.
-// Core Image renders each NEW source frame once (on the GPU) into a cached buffer matching the
-// destination; every emit then does a cheap CPU copy of that cache into the camera's buffer. The
-// cache is essential: the emit hook fires many times per source frame (multiple output nodes), so
-// rendering per-emit would be ~5-6x the GPU work. Source is BGRA (mp4 decoder, or NDIShmSource's
-// UYVY->BGRA); destination is the camera buffer (e.g. 420v) — CIContext does RGB->YUV + scale, and
-// rotation is a free orientation transform in the render.
+// GPU scale+convert+rotate (Metal-backed CIContext), rendered OFF the emit thread.
+//
+// The render (~GPU time, several ms) must never block mediaserverd's emit thread or the camera
+// pipeline stutters. So: a background caller (VCamCore's render timer) hands each NEW source frame
+// to -renderSource:, which GPU-renders it into a triple-buffered "ready" slot for every destination
+// geometry the emit path has registered. The emit path calls -copyLatestInto:, which only does a
+// CPU memcpy of the latest ready slot into the camera buffer — microseconds, never blocks.
+//
+// Source is BGRA (mp4 decoder, or NDIShmSource's UYVY->BGRA); destination is the camera buffer
+// (e.g. 420v). CIContext does RGB->YUV + scale; rotation is a free orientation transform.
 
 #import "GPUImageProcessor.h"
 #import <CoreImage/CoreImage.h>
 #import <Metal/Metal.h>
 #import <mach/mach_time.h>
+#import <os/lock.h>
 #import <stdatomic.h>
+
+#define VCAM_GEOM_POOL 3
 
 static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) {
     if (CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return NO;
     if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) {
-        CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-        return NO;
+        CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly); return NO;
     }
     BOOL ok = YES;
     if (!CVPixelBufferIsPlanar(src)) {
-        const uint8_t *sp = CVPixelBufferGetBaseAddress(src);
-        uint8_t *dp = CVPixelBufferGetBaseAddress(dst);
+        const uint8_t *sp = CVPixelBufferGetBaseAddress(src); uint8_t *dp = CVPixelBufferGetBaseAddress(dst);
         size_t ss = CVPixelBufferGetBytesPerRow(src), ds = CVPixelBufferGetBytesPerRow(dst);
-        size_t h = CVPixelBufferGetHeight(src), copy = ss < ds ? ss : ds;
-        if (sp && dp) for (size_t y = 0; y < h; y++) memcpy(dp + y*ds, sp + y*ss, copy); else ok = NO;
+        size_t h = CVPixelBufferGetHeight(src), c = ss < ds ? ss : ds;
+        if (sp && dp) for (size_t y = 0; y < h; y++) memcpy(dp + y*ds, sp + y*ss, c); else ok = NO;
     } else {
-        size_t np = CVPixelBufferGetPlaneCount(src);
-        for (size_t p = 0; p < np; p++) {
+        for (size_t p = 0, np = CVPixelBufferGetPlaneCount(src); p < np; p++) {
             const uint8_t *sp = CVPixelBufferGetBaseAddressOfPlane(src, p);
             uint8_t *dp = CVPixelBufferGetBaseAddressOfPlane(dst, p);
-            size_t ss = CVPixelBufferGetBytesPerRowOfPlane(src, p);
-            size_t ds = CVPixelBufferGetBytesPerRowOfPlane(dst, p);
-            size_t h  = CVPixelBufferGetHeightOfPlane(src, p), copy = ss < ds ? ss : ds;
-            if (sp && dp) for (size_t y = 0; y < h; y++) memcpy(dp + y*ds, sp + y*ss, copy); else ok = NO;
+            size_t ss = CVPixelBufferGetBytesPerRowOfPlane(src, p), ds = CVPixelBufferGetBytesPerRowOfPlane(dst, p);
+            size_t h = CVPixelBufferGetHeightOfPlane(src, p), c = ss < ds ? ss : ds;
+            if (sp && dp) for (size_t y = 0; y < h; y++) memcpy(dp + y*ds, sp + y*ss, c); else ok = NO;
         }
     }
     CVPixelBufferUnlockBaseAddress(dst, 0);
@@ -41,41 +43,45 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
     return ok;
 }
 
-@interface VCamCacheEntry : NSObject { @public CVPixelBufferRef _cached; uint64_t _srcID; }
+// One destination geometry: a triple-buffer of rendered frames + the latest-ready pointer.
+@interface VCamGeom : NSObject {
+@public
+    size_t w, h; OSType fmt;
+    CVPixelBufferRef pool[VCAM_GEOM_POOL];
+    int poolIdx;
+    CVPixelBufferRef ready;     // latest fully-rendered (points into pool); not retained here
+    uint64_t readySrcID;
+    double lastSeen;            // uptime of last emit touch (to retire dead geometries)
+}
 @end
-@implementation VCamCacheEntry
-- (void)dealloc { if (_cached) CFRelease(_cached); }
+@implementation VCamGeom
+- (void)dealloc { for (int i = 0; i < VCAM_GEOM_POOL; i++) if (pool[i]) CFRelease(pool[i]); }
 @end
 
 @implementation GPUImageProcessor {
     id<MTLDevice> _device;
     CIContext *_ci;
     CGColorSpaceRef _cs;
-    NSRecursiveLock *_lock;
-    NSMutableDictionary<NSString *, VCamCacheEntry *> *_caches;
+    os_unfair_lock _lock;
+    NSMutableDictionary<NSString *, VCamGeom *> *_geoms;
     mach_timebase_info_data_t _tb;
 
-    _Atomic int _rotation;        // 0/90/180/270 clockwise
-
-    _Atomic uint64_t _renderCount;      // GPU renders (fresh frames)
-    _Atomic uint64_t _renderTotalNs;
-    _Atomic uint64_t _renderMaxNs;
-    _Atomic uint64_t _hitCount;         // emits served from cache
-    _Atomic uint64_t _failCount;
+    _Atomic int _rotation;
+    _Atomic uint64_t _renderCount, _renderTotalNs, _renderMaxNs, _hitCount, _failCount;
 }
 
 - (instancetype)init {
     if ((self = [super init])) {
         mach_timebase_info(&_tb);
-        _lock = [NSRecursiveLock new];
-        _caches = [NSMutableDictionary new];
+        _lock = OS_UNFAIR_LOCK_INIT;
+        _geoms = [NSMutableDictionary new];
         _cs = CGColorSpaceCreateDeviceRGB();
         _device = MTLCreateSystemDefaultDevice();
         NSDictionary *opts = @{ kCIContextWorkingColorSpace : [NSNull null],
                                 kCIContextOutputColorSpace  : [NSNull null] };
         _ci = _device ? [CIContext contextWithMTLDevice:_device options:opts]
                       : [CIContext contextWithOptions:opts];
-        NSLog(@"[vcam-msd] CIContext ready (metal=%d, ci=%d)", _device != nil, _ci != nil);
+        NSLog(@"[vcam-msd] CIContext ready (metal=%d ci=%d)", _device != nil, _ci != nil);
     }
     return self;
 }
@@ -86,11 +92,13 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
     atomic_store_explicit(&_rotation, ((degrees % 360) + 360) % 360, memory_order_relaxed);
 }
 
-// GPU render src (BGRA) -> dstBuf (dst format), scaled to fill and rotated. Caller holds _lock.
-- (BOOL)renderFrom:(CVPixelBufferRef)src into:(CVPixelBufferRef)dstBuf w:(size_t)w h:(size_t)h {
+- (double)nowSec {
+    return (double)(mach_absolute_time() * _tb.numer / _tb.denom) / 1.0e9;
+}
+
+- (BOOL)renderImage:(CIImage *)srcImg into:(CVPixelBufferRef)buf w:(size_t)w h:(size_t)h {
     @try {
-        CIImage *img = [CIImage imageWithCVPixelBuffer:src];
-        if (!img) return NO;
+        CIImage *img = srcImg;
         int rot = atomic_load_explicit(&_rotation, memory_order_relaxed);
         CGImagePropertyOrientation o = kCGImagePropertyOrientationUp;
         if      (rot == 90)  o = kCGImagePropertyOrientationRight;
@@ -102,63 +110,81 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
             img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(-e.origin.x, -e.origin.y)];
         e = img.extent;
         if (e.size.width < 1 || e.size.height < 1) return NO;
-        img = [img imageByApplyingTransform:CGAffineTransformMakeScale((CGFloat)w / e.size.width,
-                                                                       (CGFloat)h / e.size.height)];
-        [_ci render:img toCVPixelBuffer:dstBuf bounds:CGRectMake(0, 0, w, h) colorSpace:_cs];
+        img = [img imageByApplyingTransform:CGAffineTransformMakeScale((CGFloat)w/e.size.width,
+                                                                       (CGFloat)h/e.size.height)];
+        [_ci render:img toCVPixelBuffer:buf bounds:CGRectMake(0,0,w,h) colorSpace:_cs];
         return YES;
-    } @catch (id ex) {
-        NSLog(@"[vcam-msd] CIContext render exception: %@", ex);
-        return NO;
+    } @catch (id ex) { NSLog(@"[vcam-msd] render exception: %@", ex); return NO; }
+}
+
+- (void)renderSource:(CVPixelBufferRef)src srcID:(uint64_t)srcID {
+    if (!src || !_ci) return;
+    CIImage *srcImg = [CIImage imageWithCVPixelBuffer:src];
+    if (!srcImg) return;
+
+    // Snapshot the list of live geometries (touched by an emit in the last ~2s).
+    double now = [self nowSec];
+    os_unfair_lock_lock(&_lock);
+    NSMutableArray<VCamGeom *> *live = [NSMutableArray array];
+    NSMutableArray<NSString *> *dead = [NSMutableArray array];
+    [_geoms enumerateKeysAndObjectsUsingBlock:^(NSString *k, VCamGeom *g, BOOL *s) {
+        if (now - g->lastSeen > 2.0) [dead addObject:k]; else [live addObject:g];
+    }];
+    for (NSString *k in dead) [_geoms removeObjectForKey:k];
+    os_unfair_lock_unlock(&_lock);
+
+    for (VCamGeom *g in live) {
+        os_unfair_lock_lock(&_lock);
+        int idx = g->poolIdx;
+        CVPixelBufferRef buf = g->pool[idx];
+        if (!buf) {
+            NSDictionary *attrs = @{ (NSString *)kCVPixelBufferIOSurfacePropertiesKey : @{} };
+            if (CVPixelBufferCreate(kCFAllocatorDefault, g->w, g->h, g->fmt,
+                                    (__bridge CFDictionaryRef)attrs, &buf) == kCVReturnSuccess) {
+                g->pool[idx] = buf;
+            } else buf = NULL;
+        }
+        size_t w = g->w, h = g->h;
+        os_unfair_lock_unlock(&_lock);
+        if (!buf) continue;
+
+        uint64_t r0 = mach_absolute_time();
+        BOOL ok = [self renderImage:srcImg into:buf w:w h:h];
+        if (!ok) { atomic_fetch_add_explicit(&_failCount, 1, memory_order_relaxed); continue; }
+
+        uint64_t dt = (mach_absolute_time() - r0) * _tb.numer / _tb.denom;
+        atomic_fetch_add_explicit(&_renderCount, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&_renderTotalNs, dt, memory_order_relaxed);
+        uint64_t prev = atomic_load_explicit(&_renderMaxNs, memory_order_relaxed);
+        while (dt > prev && !atomic_compare_exchange_weak_explicit(&_renderMaxNs, &prev, dt,
+                   memory_order_relaxed, memory_order_relaxed)) {}
+
+        os_unfair_lock_lock(&_lock);
+        g->ready = buf; g->readySrcID = srcID;
+        g->poolIdx = (idx + 1) % VCAM_GEOM_POOL;   // next render uses a different slot
+        os_unfair_lock_unlock(&_lock);
     }
 }
 
-- (BOOL)transferFrom:(CVPixelBufferRef)src srcID:(uint64_t)srcID into:(CVPixelBufferRef)dst {
-    if (!src || !dst || !_ci) return NO;
-    size_t dstW = CVPixelBufferGetWidth(dst), dstH = CVPixelBufferGetHeight(dst);
-    OSType dstFmt = CVPixelBufferGetPixelFormatType(dst);
+- (BOOL)copyLatestInto:(CVPixelBufferRef)dst {
+    if (!dst) return NO;
+    size_t w = CVPixelBufferGetWidth(dst), h = CVPixelBufferGetHeight(dst);
+    OSType fmt = CVPixelBufferGetPixelFormatType(dst);
+    NSString *key = [NSString stringWithFormat:@"%zu_%zu_%u", w, h, (unsigned)fmt];
 
-    [_lock lock];
-    NSString *key = [NSString stringWithFormat:@"%zu_%zu_%u", dstW, dstH, (unsigned)dstFmt];
-    VCamCacheEntry *entry = _caches[key];
-    if (!entry) {
-        NSDictionary *attrs = @{ (NSString *)kCVPixelBufferIOSurfacePropertiesKey : @{} };
-        CVPixelBufferRef pb = NULL;
-        if (CVPixelBufferCreate(kCFAllocatorDefault, dstW, dstH, dstFmt,
-                                (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess || !pb) {
-            [_lock unlock]; return NO;
-        }
-        entry = [VCamCacheEntry new];
-        entry->_cached = pb; entry->_srcID = 0;
-        _caches[key] = entry;
-    }
+    os_unfair_lock_lock(&_lock);
+    VCamGeom *g = _geoms[key];
+    if (!g) { g = [VCamGeom new]; g->w = w; g->h = h; g->fmt = fmt; _geoms[key] = g; }
+    g->lastSeen = [self nowSec];
+    CVPixelBufferRef ready = g->ready;
+    if (ready) CFRetain(ready);
+    os_unfair_lock_unlock(&_lock);
 
-    BOOL ok = YES;
-    if (entry->_srcID != srcID) {               // fresh frame -> one GPU render
-        uint64_t r0 = mach_absolute_time();
-        ok = [self renderFrom:src into:entry->_cached w:dstW h:dstH];
-        if (ok) {
-            entry->_srcID = srcID;
-            uint64_t dt = (mach_absolute_time() - r0) * _tb.numer / _tb.denom;
-            atomic_fetch_add_explicit(&_renderCount, 1, memory_order_relaxed);
-            atomic_fetch_add_explicit(&_renderTotalNs, dt, memory_order_relaxed);
-            uint64_t prev = atomic_load_explicit(&_renderMaxNs, memory_order_relaxed);
-            while (dt > prev && !atomic_compare_exchange_weak_explicit(&_renderMaxNs, &prev, dt,
-                       memory_order_relaxed, memory_order_relaxed)) {}
-        } else {
-            atomic_fetch_add_explicit(&_failCount, 1, memory_order_relaxed);
-        }
-    } else {
-        atomic_fetch_add_explicit(&_hitCount, 1, memory_order_relaxed);
-    }
-
-    CVPixelBufferRef cached = entry->_cached;
-    if (ok) CFRetain(cached);
-    [_lock unlock];
-
-    if (!ok) return NO;
-    BOOL copied = vcam_cpuCopyPixelBuffer(cached, dst);
-    CFRelease(cached);
-    return copied;
+    if (!ready) return NO;                 // nothing rendered yet -> passthrough
+    BOOL ok = vcam_cpuCopyPixelBuffer(ready, dst);
+    CFRelease(ready);
+    if (ok) atomic_fetch_add_explicit(&_hitCount, 1, memory_order_relaxed);
+    return ok;
 }
 
 - (uint64_t)vtCallCount         { return atomic_load_explicit(&_renderCount, memory_order_relaxed)
