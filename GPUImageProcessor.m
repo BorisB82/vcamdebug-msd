@@ -124,15 +124,14 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
     CIImage *srcImg = [CIImage imageWithCVPixelBuffer:src];
     if (!srcImg) return;
 
-    // Snapshot the list of live geometries (touched by an emit in the last ~2s).
+    // Render only geometries emitted-to recently, but KEEP all entries so the diagnostic report
+    // survives the camera app being backgrounded (retiring entries erased the report).
     double now = [self nowSec];
     os_unfair_lock_lock(&_lock);
     NSMutableArray<VCamGeom *> *live = [NSMutableArray array];
-    NSMutableArray<NSString *> *dead = [NSMutableArray array];
     [_geoms enumerateKeysAndObjectsUsingBlock:^(NSString *k, VCamGeom *g, BOOL *s) {
-        if (now - g->lastSeen > 2.0) [dead addObject:k]; else [live addObject:g];
+        if (now - g->lastSeen <= 2.0) [live addObject:g];
     }];
-    for (NSString *k in dead) [_geoms removeObjectForKey:k];
     os_unfair_lock_unlock(&_lock);
 
     for (VCamGeom *g in live) {
