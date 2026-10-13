@@ -308,7 +308,8 @@ int main(int argc, char *argv[]) {
                     chosen = *pick;
                 }
 
-                NSLog(@"[vcam-ndi] connecting to %@", chosenName);
+                NSLog(@"[vcam-ndi] connecting to %@ (pubOK=%d fileSize=%llu)",
+                      chosenName, pubOK, (unsigned long long)VCAMNDI_FILE_SIZE);
                 NDIlib_recv_create_v3_t rcreate = {
                     .source_to_connect_to = chosen,
                     // BGRA out: matches the mp4 path so VideoToolbox's BGRA->420v scale is the
@@ -333,6 +334,7 @@ int main(int argc, char *argv[]) {
                 BOOL stayConnected = YES;
                 double lastArrival = 0.0, maxGapMs = 0.0;   // inter-frame jitter in window
                 long long droppedAtLastStat = 0;
+                BOOL loggedFirstFrame = NO;
 
                 while (stayConnected && !gReload) {
                     @autoreleasepool {
@@ -343,6 +345,12 @@ int main(int argc, char *argv[]) {
                         if (type == NDIlib_frame_type_video) {
                             framesTotal++;
                             lastX = vid.xres; lastY = vid.yres; lastFourCC = (int)vid.FourCC;
+                            if (!loggedFirstFrame) {
+                                char fcc[5] = {0}; fourccToStr((int)vid.FourCC, fcc);
+                                NSLog(@"[vcam-ndi] first frame: %dx%d fourcc=%s stride=%d",
+                                      vid.xres, vid.yres, fcc, vid.line_stride_in_bytes);
+                                loggedFirstFrame = YES;
+                            }
                             double nowA = NSProcessInfo.processInfo.systemUptime;
                             if (lastArrival > 0.0) {
                                 double gap = (nowA - lastArrival) * 1000.0;

@@ -2,6 +2,7 @@
 #import "VCamNDIShared.h"
 
 #import <sys/mman.h>
+#import <sys/stat.h>
 #import <fcntl.h>
 #import <unistd.h>
 #import <os/lock.h>
@@ -11,6 +12,7 @@
     int _fd;
     const uint8_t *_base;
     const VCamNDIHeader *_hdr;
+    size_t _mappedSize;          // actual bytes mapped (= file size), to bound reads
     BOOL _running;
 
     os_unfair_lock _lock;            // guards the local pool
@@ -31,19 +33,28 @@
         if (_running) return;
         _fd = open(VCAMNDI_PATH, O_RDONLY);
         if (_fd < 0) { NSLog(@"[vcam-msd] ndi shm open failed: %s", strerror(errno)); return; }
-        void *m = mmap(NULL, (size_t)VCAMNDI_FILE_SIZE, PROT_READ, MAP_SHARED, _fd, 0);
+        // Map the file's ACTUAL size, not the compile-time expectation. If a stale/smaller
+        // file is present (e.g. from an older daemon with a different slot size), mapping the
+        // full size and reading a high slot would SIGBUS mediaserverd. We bound reads to
+        // _mappedSize instead.
+        struct stat st;
+        if (fstat(_fd, &st) != 0 || (size_t)st.st_size < VCAMNDI_HEADER_SIZE) {
+            NSLog(@"[vcam-msd] ndi shm too small/fstat failed"); close(_fd); _fd = -1; return;
+        }
+        _mappedSize = (size_t)st.st_size;
+        void *m = mmap(NULL, _mappedSize, PROT_READ, MAP_SHARED, _fd, 0);
         if (m == MAP_FAILED) { NSLog(@"[vcam-msd] ndi shm mmap failed: %s", strerror(errno));
-                               close(_fd); _fd = -1; return; }
+                               close(_fd); _fd = -1; _mappedSize = 0; return; }
         _base = (const uint8_t *)m;
         _hdr  = (const VCamNDIHeader *)m;
         _running = YES;
-        NSLog(@"[vcam-msd] ndi shm mapped");
+        NSLog(@"[vcam-msd] ndi shm mapped (%zu bytes)", _mappedSize);
     }
 }
 
 - (void)stop {
     @synchronized(self) {
-        if (_base) { munmap((void *)_base, (size_t)VCAMNDI_FILE_SIZE); _base = NULL; _hdr = NULL; }
+        if (_base) { munmap((void *)_base, _mappedSize); _base = NULL; _hdr = NULL; _mappedSize = 0; }
         if (_fd >= 0) { close(_fd); _fd = -1; }
         _running = NO;
     }
@@ -93,6 +104,8 @@
         uint32_t w = h->width, hh = h->height, rb = h->rowBytes;
         if (idx >= VCAMNDI_RING || w < 2 || hh < 2 || rb == 0) return NULL;
         if ((size_t)rb * hh > VCAMNDI_SLOT_BYTES) return NULL;   // sanity
+        // Bound the slot against the actually-mapped size to avoid SIGBUS on a stale file.
+        if (vcamndi_slot_offset(idx) + (uint64_t)rb * hh > _mappedSize) return NULL;
 
         os_unfair_lock_lock(&_lock);
         if (![self ensurePoolW:w h:hh]) { os_unfair_lock_unlock(&_lock); return NULL; }
