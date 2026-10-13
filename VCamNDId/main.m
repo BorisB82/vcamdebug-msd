@@ -340,6 +340,15 @@ int main(int argc, char *argv[]) {
                             }
                         }
                     }
+                    // A `source` filter is a preference, not a hard gate: if it matches nothing
+                    // but a source exists, use the first one rather than searching forever (a
+                    // stale/placeholder filter must never wedge discovery).
+                    if (!pick && n > 0) {
+                        pick = &srcs[0];
+                        chosenName = srcs[0].p_ndi_name ? @(srcs[0].p_ndi_name) : @"(unnamed)";
+                        NSLog(@"[vcam-ndi] source filter '%@' matched nothing; using first: %@",
+                              cfg.source, chosenName);
+                    }
                     writeStatsSearching(n, names, curExtraIps);
                     if (!pick) {
                         for (int i = 0; i < 5 && !gReload; i++) [NSThread sleepForTimeInterval:0.1];
