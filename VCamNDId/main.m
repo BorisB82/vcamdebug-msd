@@ -67,20 +67,26 @@ static void pub_set_enabled(VCamNDIPublisher *p, BOOL on) {
     if (p->hdr) p->hdr->enabled = on ? 1 : 0;
 }
 
-// Publish a packed UYVY (4:2:2, stride = w*2) frame into the next ring slot as-is. The byte
-// reorganize to NV12 was moved back out: doing it in the daemon process starved NDI's internal
-// network thread and dropped the connection. The consumer takes UYVY directly. This runs on the
-// CONVERTER thread and is just a memcpy, so it stays cheap. Kept decoupled from capture so a
-// stall drops frames, not the NDI link.
-static void pub_write_packed(VCamNDIPublisher *p, const uint8_t *src, uint32_t w, uint32_t h) {
-    if (!p->hdr || !src) return;
+static VCamNDIPublisher gPub;
+
+// Publish one UYVY frame straight into the next ring slot, inline on the capture thread (as the
+// stable 0.3.0 build did). It's just a row-wise memcpy — cheap enough that it doesn't need a
+// separate converter thread. The earlier decouple (added for the NV12 convert) correlated with
+// a ~3s connect/drop loop and bought nothing once we went back to passthrough, so it's gone.
+static void pub_write(VCamNDIPublisher *p, const NDIlib_video_frame_v2_t *vid) {
+    if (!p->hdr) return;
+    uint32_t w = (uint32_t)vid->xres, h = (uint32_t)vid->yres;
     if (w < 2 || h < 2 || (w & 1u) || (h & 1u)) return;
     if (w > VCAMNDI_MAX_W || h > VCAMNDI_MAX_H) return;
     uint32_t rowBytes = w * 2u;
+    int srcStride = vid->line_stride_in_bytes ? vid->line_stride_in_bytes : (int)rowBytes;
+    const uint8_t *src = vid->p_data;
+    if (!src) return;
 
     uint32_t idx = p->writeIndex;
     uint8_t *slot = p->base + vcamndi_slot_offset(idx);
-    memcpy(slot, src, (size_t)rowBytes * h);                 // src is packed UYVY
+    for (uint32_t y = 0; y < h; y++)
+        memcpy(slot + (size_t)y * rowBytes, src + (size_t)y * srcStride, rowBytes);
 
     if (p->hdr->width != w || p->hdr->height != h || p->hdr->magic != VCAMNDI_MAGIC) {
         p->hdr->width = w; p->hdr->height = h;
@@ -98,54 +104,6 @@ static void pub_write_packed(VCamNDIPublisher *p, const uint8_t *src, uint32_t w
     p->hdr->frameSeq = seq + 2;                 // -> even, new frame id
 
     p->writeIndex = (idx + 1) % VCAMNDI_RING;
-}
-
-// ---- Capture/convert decoupling ------------------------------------------
-// The NDI capture thread must stay responsive or the sender drops the connection, so it only
-// does a fast packed copy of the latest frame into a hand-off buffer (latest wins; older
-// unconsumed frames are overwritten) and signals the converter. The converter thread does the
-// heavy UYVY->NV12 + publish. gPub is shared; only the converter touches the ring.
-static VCamNDIPublisher gPub;
-static pthread_mutex_t  gRawLock = PTHREAD_MUTEX_INITIALIZER;
-static dispatch_semaphore_t gRawSignal;
-static uint8_t  *gRawBuf = NULL;       // packed UYVY, capacity VCAMNDI_SLOT_BYTES
-static uint32_t  gRawW = 0, gRawH = 0;
-static uint64_t  gRawSeq = 0;          // bumped on each new captured frame
-static volatile int gConverterRun = 1;
-
-// Capture thread: fast packed copy + signal. Returns quickly so capture_v2 is called again soon.
-static void handoff_raw(const NDIlib_video_frame_v2_t *vid) {
-    uint32_t w = (uint32_t)vid->xres, h = (uint32_t)vid->yres;
-    if (w < 2 || h < 2 || (w & 1u) || (h & 1u)) return;
-    if (w > VCAMNDI_MAX_W || h > VCAMNDI_MAX_H) return;
-    uint32_t dstStride = w * 2u;      // UYVY
-    int srcStride = vid->line_stride_in_bytes ? vid->line_stride_in_bytes : (int)dstStride;
-    const uint8_t *src = vid->p_data;
-    if (!src) return;
-
-    pthread_mutex_lock(&gRawLock);
-    for (uint32_t y = 0; y < h; y++)
-        memcpy(gRawBuf + (size_t)y * dstStride, src + (size_t)y * srcStride, dstStride);
-    gRawW = w; gRawH = h; gRawSeq++;
-    pthread_mutex_unlock(&gRawLock);
-    dispatch_semaphore_signal(gRawSignal);
-}
-
-static void *converter_main(void *arg) {
-    uint8_t *local = malloc(VCAMNDI_SLOT_BYTES);
-    uint64_t lastSeq = 0;
-    while (gConverterRun) {
-        dispatch_semaphore_wait(gRawSignal, dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC));
-        uint32_t w = 0, h = 0;
-        pthread_mutex_lock(&gRawLock);
-        if (gRawSeq == lastSeq || !local) { pthread_mutex_unlock(&gRawLock); continue; }
-        lastSeq = gRawSeq; w = gRawW; h = gRawH;
-        memcpy(local, gRawBuf, (size_t)w * h * 2u);      // snapshot packed UYVY
-        pthread_mutex_unlock(&gRawLock);
-        pub_write_packed(&gPub, local, w, h);
-    }
-    if (local) free(local);
-    return NULL;
 }
 
 
@@ -279,18 +237,6 @@ int main(int argc, char *argv[]) {
 
         BOOL pubOK = pub_open(&gPub);
         if (!pubOK) NSLog(@"[vcam-ndi] continuing without shm publish");
-
-        // Start the converter thread + hand-off buffer (keeps the capture thread tight).
-        pthread_t convThread = 0;
-        if (pubOK) {
-            gRawBuf = malloc(VCAMNDI_SLOT_BYTES);
-            gRawSignal = dispatch_semaphore_create(0);
-            if (!gRawBuf || !gRawSignal ||
-                pthread_create(&convThread, NULL, converter_main, NULL) != 0) {
-                NSLog(@"[vcam-ndi] converter thread start failed; no shm publish");
-                pubOK = NO;
-            }
-        }
 
         int token;
         notify_register_dispatch(kNoteReload, &token,
@@ -435,12 +381,11 @@ int main(int argc, char *argv[]) {
                                 if (gap > maxGapMs) maxGapMs = gap;
                             }
                             lastArrival = nowA;
-                            // Hand the frame to the publisher thread (fast copy) and free the NDI
-                            // frame immediately so capture_v2 is called again promptly, keeping the
-                            // NDI connection alive. 'fastest' delivers UYVY (4:2:2).
+                            // Publish inline, then free the NDI frame immediately so capture_v2 is
+                            // called again promptly. 'fastest' delivers UYVY (4:2:2).
                             if (pubOK && vid.FourCC == NDIlib_FourCC_type_UYVY) {
                                 pub_set_enabled(&gPub, YES);
-                                handoff_raw(&vid);
+                                pub_write(&gPub, &vid);
                             }
                             NDIlib_recv_free_video_v2(recv, &vid);   // free immediately
                         } else if (type == NDIlib_frame_type_error) {
