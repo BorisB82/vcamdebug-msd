@@ -5,6 +5,7 @@
 #import <sys/stat.h>
 #import <fcntl.h>
 #import <unistd.h>
+#import <Accelerate/Accelerate.h>
 #import <os/lock.h>
 #import <stdatomic.h>
 
@@ -17,8 +18,23 @@
 
     os_unfair_lock _lock;            // guards the local pool
     uint32_t _w, _h;
-    CVPixelBufferRef _pool[VCAMNDI_RING];
+    CVPixelBufferRef _pool[VCAMNDI_RING];   // 32BGRA (hardware VT transfer path)
     int _poolIdx;
+
+    vImage_YpCbCrToARGB _ycInfo;     // UYVY(422) -> ARGB conversion info
+    BOOL _ycReady;
+}
+
+// UYVY is byte order Cb Y Cr Y (== "422CbYpCrYp8"). Build the YpCbCr->ARGB conversion once,
+// BT.709 video-range (standard for HD NDI). Colors can be retuned here without touching stability.
+- (void)ensureConversion {
+    if (_ycReady) return;
+    vImage_YpCbCrPixelRange range = { 16, 128, 235, 240, 255, 0, 255, 0 }; // 8-bit video range
+    vImage_Error e = vImageConvert_YpCbCrToARGB_GenerateConversion(
+        kvImage_YpCbCrToARGBMatrix_ITU_R_709_2, &range, &_ycInfo,
+        kvImage422CbYpCrYp8, kvImageARGB8888, kvImageNoFlags);
+    if (e == kvImageNoError) _ycReady = YES;
+    else NSLog(@"[vcam-msd] vImage conversion gen failed: %ld", (long)e);
 }
 
 - (instancetype)init {
@@ -71,7 +87,10 @@
     return (seq & 1ULL) ? 0 : seq;   // odd = write in progress
 }
 
-// Caller holds _lock. UYVY / 422 single-plane to match the daemon's published format.
+// Caller holds _lock. 32BGRA pool: the daemon publishes UYVY, we convert UYVY->BGRA here with
+// vImage, and hand BGRA to VideoToolbox — the same hardware transfer path the mp4 source uses
+// (UYVY->420v directly was the software fallback / -12905). This conversion is in mediaserverd,
+// which does not affect the NDI daemon's connection.
 - (BOOL)ensurePoolW:(uint32_t)w h:(uint32_t)h {
     if (_w == w && _h == h && _pool[0]) return YES;
     for (int i = 0; i < (int)VCAMNDI_RING; i++) { if (_pool[i]) { CFRelease(_pool[i]); _pool[i] = NULL; } }
@@ -80,7 +99,7 @@
     for (int i = 0; i < (int)VCAMNDI_RING; i++) {
         CVPixelBufferRef pb = NULL;
         CVReturn r = CVPixelBufferCreate(kCFAllocatorDefault, w, h,
-                                         kCVPixelFormatType_422YpCbCr8,
+                                         kCVPixelFormatType_32BGRA,
                                          (__bridge CFDictionaryRef)attrs, &pb);
         if (r != kCVReturnSuccess || !pb) {
             NSLog(@"[vcam-msd] ndi pool create failed (%d)", r);
@@ -107,17 +126,21 @@
         if (vcamndi_slot_offset(idx) + (uint64_t)rb * hh > _mappedSize) return NULL;
 
         os_unfair_lock_lock(&_lock);
-        if (![self ensurePoolW:w h:hh]) { os_unfair_lock_unlock(&_lock); return NULL; }
+        [self ensureConversion];
+        if (!_ycReady || ![self ensurePoolW:w h:hh]) { os_unfair_lock_unlock(&_lock); return NULL; }
         CVPixelBufferRef dst = _pool[_poolIdx];
         const uint8_t *slot = _base + vcamndi_slot_offset(idx);   // packed UYVY, rowBytes = rb
 
         CVPixelBufferLockBaseAddress(dst, 0);
-        uint8_t *dstBase = CVPixelBufferGetBaseAddress(dst);
-        size_t dstStride = CVPixelBufferGetBytesPerRow(dst);
-        size_t copyBytes = rb < dstStride ? rb : dstStride;
-        for (uint32_t y = 0; y < hh; y++)
-            memcpy(dstBase + (size_t)y * dstStride, slot + (size_t)y * rb, copyBytes);
+        // UYVY (422) -> BGRA via vImage. permuteMap {3,2,1,0} turns ARGB into BGRA byte order.
+        vImage_Buffer srcB = { .data = (void *)slot, .height = hh, .width = w, .rowBytes = rb };
+        vImage_Buffer dstB = { .data = CVPixelBufferGetBaseAddress(dst), .height = hh, .width = w,
+                               .rowBytes = CVPixelBufferGetBytesPerRow(dst) };
+        const uint8_t permuteMap[4] = { 3, 2, 1, 0 };
+        vImage_Error ve = vImageConvert_422CbYpCrYp8ToARGB8888(&srcB, &dstB, &_ycInfo,
+                                                               permuteMap, 255, kvImageNoFlags);
         CVPixelBufferUnlockBaseAddress(dst, 0);
+        if (ve != kvImageNoError) { os_unfair_lock_unlock(&_lock); return NULL; }
 
         atomic_thread_fence(memory_order_acquire);
         uint64_t s2 = h->frameSeq;
