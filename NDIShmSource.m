@@ -60,7 +60,8 @@
     return (seq & 1ULL) ? 0 : seq;   // odd = write in progress
 }
 
-// Caller holds _lock. UYVY / 422 single-plane to match the daemon's published format.
+// Caller holds _lock. 32BGRA single-plane to match the daemon's published format (same as
+// the mp4 path, so VideoToolbox's BGRA->dst transfer is the hardware path).
 - (BOOL)ensurePoolW:(uint32_t)w h:(uint32_t)h {
     if (_w == w && _h == h && _pool[0]) return YES;
     for (int i = 0; i < (int)VCAMNDI_RING; i++) { if (_pool[i]) { CFRelease(_pool[i]); _pool[i] = NULL; } }
@@ -69,7 +70,7 @@
     for (int i = 0; i < (int)VCAMNDI_RING; i++) {
         CVPixelBufferRef pb = NULL;
         CVReturn r = CVPixelBufferCreate(kCFAllocatorDefault, w, h,
-                                         kCVPixelFormatType_422YpCbCr8,
+                                         kCVPixelFormatType_32BGRA,
                                          (__bridge CFDictionaryRef)attrs, &pb);
         if (r != kCVReturnSuccess || !pb) {
             NSLog(@"[vcam-msd] ndi pool create failed (%d)", r);

@@ -76,15 +76,15 @@ static void pub_write_packed(VCamNDIPublisher *p, const uint8_t *src, uint32_t w
     if (!p->hdr || !src) return;
     if (w < 2 || h < 2 || (w & 1u) || (h & 1u)) return;
     if (w > VCAMNDI_MAX_W || h > VCAMNDI_MAX_H) return;
-    uint32_t rowBytes = w * 2u;
+    uint32_t rowBytes = w * 4u;
 
     uint32_t idx = p->writeIndex;
     uint8_t *slot = p->base + vcamndi_slot_offset(idx);
-    memcpy(slot, src, (size_t)rowBytes * h);                 // src is packed UYVY
+    memcpy(slot, src, (size_t)rowBytes * h);                 // src is packed BGRA
 
     if (p->hdr->width != w || p->hdr->height != h || p->hdr->magic != VCAMNDI_MAGIC) {
         p->hdr->width = w; p->hdr->height = h;
-        p->hdr->rowBytes = rowBytes; p->hdr->fourcc = VCAMNDI_FOURCC_2VUY;
+        p->hdr->rowBytes = rowBytes; p->hdr->fourcc = VCAMNDI_FOURCC_BGRA;
         atomic_thread_fence(memory_order_release);
         p->hdr->configGen = p->hdr->configGen + 1;
         p->hdr->magic = VCAMNDI_MAGIC;
@@ -118,7 +118,7 @@ static void handoff_raw(const NDIlib_video_frame_v2_t *vid) {
     uint32_t w = (uint32_t)vid->xres, h = (uint32_t)vid->yres;
     if (w < 2 || h < 2 || (w & 1u) || (h & 1u)) return;
     if (w > VCAMNDI_MAX_W || h > VCAMNDI_MAX_H) return;
-    uint32_t dstStride = w * 2u;
+    uint32_t dstStride = w * 4u;      // BGRA
     int srcStride = vid->line_stride_in_bytes ? vid->line_stride_in_bytes : (int)dstStride;
     const uint8_t *src = vid->p_data;
     if (!src) return;
@@ -311,7 +311,9 @@ int main(int argc, char *argv[]) {
                 NSLog(@"[vcam-ndi] connecting to %@", chosenName);
                 NDIlib_recv_create_v3_t rcreate = {
                     .source_to_connect_to = chosen,
-                    .color_format = NDIlib_recv_color_format_fastest,
+                    // BGRA out: matches the mp4 path so VideoToolbox's BGRA->420v scale is the
+                    // hardware path (UYVY source hit a software fallback / -12905 on the A11).
+                    .color_format = NDIlib_recv_color_format_BGRX_BGRA,
                     .bandwidth    = NDIlib_recv_bandwidth_highest,
                     .allow_video_fields = true,
                     .p_ndi_recv_name = "VCamNDI",
@@ -347,11 +349,12 @@ int main(int argc, char *argv[]) {
                                 if (gap > maxGapMs) maxGapMs = gap;
                             }
                             lastArrival = nowA;
-                            // Hand the frame to the converter thread (fast copy) and free the NDI
-                            // frame immediately so capture_v2 is called again promptly — this keeps
-                            // the NDI connection alive even when conversion is slow. NDI "fastest"
-                            // on SDR is UYVY; other FourCCs aren't bridged this milestone.
-                            if (pubOK && vid.FourCC == NDIlib_FourCC_type_UYVY) {
+                            // Hand the frame to the publisher thread (fast copy) and free the NDI
+                            // frame immediately so capture_v2 is called again promptly, keeping the
+                            // NDI connection alive. We requested BGRX_BGRA, so frames arrive as
+                            // BGRA (alpha) or BGRX (opaque) — both 32-bit BGRA byte order.
+                            if (pubOK && (vid.FourCC == NDIlib_FourCC_type_BGRA ||
+                                          vid.FourCC == NDIlib_FourCC_type_BGRX)) {
                                 pub_set_enabled(&gPub, YES);
                                 handoff_raw(&vid);
                             }
