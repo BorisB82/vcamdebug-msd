@@ -257,14 +257,11 @@ int main(int argc, char *argv[]) {
 
         // Start the converter thread + hand-off buffer (keeps the capture thread tight).
         pthread_t convThread = 0;
-        BOOL convOK = NO;
         if (pubOK) {
             gRawBuf = malloc(VCAMNDI_SLOT_BYTES);
             gRawSignal = dispatch_semaphore_create(0);
-            if (gRawBuf && gRawSignal &&
-                pthread_create(&convThread, NULL, converter_main, NULL) == 0) {
-                convOK = YES;
-            } else {
+            if (!gRawBuf || !gRawSignal ||
+                pthread_create(&convThread, NULL, converter_main, NULL) != 0) {
                 NSLog(@"[vcam-ndi] converter thread start failed; no shm publish");
                 pubOK = NO;
             }
