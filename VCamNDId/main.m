@@ -173,6 +173,27 @@ static void fourccToStr(int fcc, char out[5]) {
     out[2] = (char)((fcc >> 16) & 0xff); out[3] = (char)((fcc >> 24) & 0xff); out[4] = 0;
 }
 
+// Append-only event log (NSLog doesn't reach a file for a RootHide daemon; this does, like the
+// stats). One read shows the whole connection lifecycle. Capped so it can't grow unbounded.
+static NSString *const kEventsFile = @"/var/mobile/Media/DCIM/vcam_ndi_events.txt";
+static void ev(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSString *line = [NSString stringWithFormat:@"%@  %@\n",
+        [NSDateFormatter localizedStringFromDate:NSDate.date
+                                       dateStyle:NSDateFormatterNoStyle
+                                       timeStyle:NSDateFormatterMediumStyle], msg];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kEventsFile];
+    if (!fh || [fh seekToEndOfFile] > 200000) {   // (re)create if missing or too big
+        [fh closeFile];
+        [line writeToFile:kEventsFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        return;
+    }
+    @try { [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; } @catch (id e) {}
+    [fh closeFile];
+}
+
 static void writeStats(NSString *state, NSString *sourceName,
                        int xres, int yres, int fourcc, double fps,
                        unsigned long long frames) {
@@ -247,6 +268,7 @@ static void writeStatsConnected(NSString *sourceName, int xres, int yres, int fo
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         NSLog(@"[vcam-ndi] starting");
+        ev(@"=== daemon starting ===");
 
         if (!NDIlib_initialize()) {
             NSLog(@"[vcam-ndi] NDIlib_initialize failed (unsupported CPU?)");
@@ -302,6 +324,7 @@ int main(int argc, char *argv[]) {
                         .p_extra_ips = wantExtra.length ? wantExtra.UTF8String : NULL };
                     finder = NDIlib_find_create_v2(&fc);
                     curExtraIps = wantExtra;
+                    ev(@"finder created (extra_ips=%@)", wantExtra.length ? wantExtra : @"mDNS");
                     NSLog(@"[vcam-ndi] finder created (extra_ips=%@)",
                           wantExtra.length ? wantExtra : @"(mDNS only)");
                     if (!finder) {
@@ -357,6 +380,7 @@ int main(int argc, char *argv[]) {
                     chosen = *pick;
                 }
 
+                ev(@"connecting to '%@'", chosenName);
                 NSLog(@"[vcam-ndi] connecting to %@ (pubOK=%d fileSize=%llu)",
                       chosenName, pubOK, (unsigned long long)VCAMNDI_FILE_SIZE);
                 NDIlib_recv_create_v3_t rcreate = {
@@ -370,10 +394,12 @@ int main(int argc, char *argv[]) {
                 };
                 NDIlib_recv_instance_t recv = NDIlib_recv_create_v3(&rcreate);
                 if (!recv) {
+                    ev(@"recv_create FAILED");
                     writeStats(@"recv-create-failed", chosenName, 0, 0, 0, 0.0, framesTotal);
                     for (int i = 0; i < 10 && !gReload; i++) [NSThread sleepForTimeInterval:0.1];
                     continue;
                 }
+                ev(@"recv_create ok; entering capture loop");
 
                 // Capture loop for this connection.
                 double lastStat = NSProcessInfo.processInfo.systemUptime;
@@ -396,6 +422,9 @@ int main(int argc, char *argv[]) {
                             lastX = vid.xres; lastY = vid.yres; lastFourCC = (int)vid.FourCC;
                             if (!loggedFirstFrame) {
                                 char fcc[5] = {0}; fourccToStr((int)vid.FourCC, fcc);
+                                ev(@"first frame %dx%d fourcc=%s stride=%d (published=%d)",
+                                   vid.xres, vid.yres, fcc, vid.line_stride_in_bytes,
+                                   (pubOK && vid.FourCC == NDIlib_FourCC_type_UYVY));
                                 NSLog(@"[vcam-ndi] first frame: %dx%d fourcc=%s stride=%d",
                                       vid.xres, vid.yres, fcc, vid.line_stride_in_bytes);
                                 loggedFirstFrame = YES;
@@ -415,6 +444,7 @@ int main(int argc, char *argv[]) {
                             }
                             NDIlib_recv_free_video_v2(recv, &vid);   // free immediately
                         } else if (type == NDIlib_frame_type_error) {
+                            ev(@"capture returned ERROR after %llu frames -> disconnect", framesTotal);
                             stayConnected = NO;
                         }
                         // none / status_change: just keep polling.
@@ -445,6 +475,7 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
+                ev(@"capture loop exited (reload=%d) after %llu frames total", gReload, framesTotal);
                 if (pubOK) pub_set_enabled(&gPub, NO);
                 NDIlib_recv_destroy(recv);
             }
