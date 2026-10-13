@@ -150,17 +150,19 @@ static void *converter_main(void *arg) {
 
 
 typedef struct {
-    NSString *source;   // substring match, or nil
-    NSString *url;      // explicit ip:port, or nil
+    NSString *source;    // substring match, or nil
+    NSString *url;       // explicit ip:port, or nil
+    NSString *extraIps;  // comma-separated IPs for unicast discovery, or nil
     BOOL enabled;
 } VCamNDIConfig;
 
 static VCamNDIConfig readConfig(void) {
-    VCamNDIConfig c = { .source = nil, .url = nil, .enabled = YES };
+    VCamNDIConfig c = { .source = nil, .url = nil, .extraIps = nil, .enabled = YES };
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kConfigPlist];
     if ([d isKindOfClass:NSDictionary.class]) {
-        if ([d[@"source"] isKindOfClass:NSString.class]) c.source = d[@"source"];
-        if ([d[@"url"]    isKindOfClass:NSString.class]) c.url    = d[@"url"];
+        if ([d[@"source"]    isKindOfClass:NSString.class]) c.source   = d[@"source"];
+        if ([d[@"url"]       isKindOfClass:NSString.class]) c.url      = d[@"url"];
+        if ([d[@"extra_ips"] isKindOfClass:NSString.class]) c.extraIps = d[@"extra_ips"];
         if (d[@"enabled"] != nil) c.enabled = [d[@"enabled"] boolValue];
     }
     return c;
@@ -184,6 +186,26 @@ static void writeStats(NSString *state, NSString *sourceName,
     [s appendFormat:@"source=%@\n", sourceName.length ? sourceName : @"(none)"];
     [s appendFormat:@"frame=%dx%d fourcc=%s\n", xres, yres, fcc];
     [s appendFormat:@"fps=%.2f framesTotal=%llu\n", fps, frames];
+    [s writeToFile:kStatsFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+// Discovery diagnostics: how many NDI sources the finder currently sees, their names, and
+// whether unicast extra_ips is active. Written to the stats file every search iteration so the
+// discovery problem is visible without a working log channel.
+static void writeStatsSearching(uint32_t nSources, NSString *names, NSString *extraIps) {
+    NSMutableString *s = [NSMutableString stringWithCapacity:512];
+    [s appendFormat:@"=== vcam-ndi milestone2 @ %@ ===\n",
+        [NSDateFormatter localizedStringFromDate:NSDate.date
+                                       dateStyle:NSDateFormatterShortStyle
+                                       timeStyle:NSDateFormatterMediumStyle]];
+    [s appendFormat:@"state=searching\n"];
+    [s appendFormat:@"discovery=%@\n", extraIps.length ? [@"extra_ips " stringByAppendingString:extraIps]
+                                                       : @"mDNS only"];
+    [s appendFormat:@"sourcesFound=%u\n", nSources];
+    [s appendFormat:@"sources=%@\n", names.length ? names : @"(none)"];
+    [s appendFormat:@"--- if sourcesFound=0 ---\n"];
+    [s appendFormat:@"mDNS/multicast is blocked. Set extra_ips to the sender's IP in\n"];
+    [s appendFormat:@"/var/mobile/Media/DCIM/vcam_ndi.plist and reconnect.\n"];
     [s writeToFile:kStatsFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
@@ -253,14 +275,10 @@ int main(int argc, char *argv[]) {
                                  dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
                                  ^(int t){ (void)t; gReload = 1; });
 
-        NDIlib_find_create_t fcreate = { .show_local_sources = true,
-                                         .p_groups = NULL, .p_extra_ips = NULL };
-        NDIlib_find_instance_t finder = NDIlib_find_create_v2(&fcreate);
-        if (!finder) {
-            NSLog(@"[vcam-ndi] find_create failed");
-            writeStats(@"find-create-failed", nil, 0, 0, 0, 0, 0);
-            [NSThread sleepForTimeInterval:30]; return 1;
-        }
+        // The finder is (re)created inside the loop so an extra_ips change (unicast discovery
+        // bypassing mDNS multicast) takes effect without a daemon restart.
+        NDIlib_find_instance_t finder = NULL;
+        NSString *curExtraIps = nil;
 
         unsigned long long framesTotal = 0;
 
@@ -276,6 +294,23 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
+                // (Re)create the finder if extra_ips changed (or first time).
+                NSString *wantExtra = cfg.extraIps ?: @"";
+                if (!finder || ![curExtraIps isEqualToString:wantExtra]) {
+                    if (finder) NDIlib_find_destroy(finder);
+                    NDIlib_find_create_t fc = { .show_local_sources = true, .p_groups = NULL,
+                        .p_extra_ips = wantExtra.length ? wantExtra.UTF8String : NULL };
+                    finder = NDIlib_find_create_v2(&fc);
+                    curExtraIps = wantExtra;
+                    NSLog(@"[vcam-ndi] finder created (extra_ips=%@)",
+                          wantExtra.length ? wantExtra : @"(mDNS only)");
+                    if (!finder) {
+                        writeStats(@"find-create-failed", nil, 0, 0, 0, 0.0, framesTotal);
+                        for (int i = 0; i < 10 && !gReload; i++) [NSThread sleepForTimeInterval:0.1];
+                        continue;
+                    }
+                }
+
                 // Resolve a source: explicit url, else substring match, else first found.
                 NDIlib_source_t chosen = (NDIlib_source_t){0};
                 NSString *chosenName = nil;
@@ -287,21 +322,26 @@ int main(int argc, char *argv[]) {
                     chosen.p_url_address = urlBuf;
                     chosenName = [NSString stringWithFormat:@"url:%@", cfg.url];
                 } else {
-                    writeStats(@"searching", nil, 0, 0, 0, 0.0, framesTotal);
                     NDIlib_find_wait_for_sources(finder, 2000);
                     uint32_t n = 0;
                     const NDIlib_source_t *srcs = NDIlib_find_get_current_sources(finder, &n);
+                    // Record how many sources the finder sees + their names, so the stats file
+                    // shows whether discovery (mDNS or extra_ips unicast) is working at all.
+                    NSMutableString *names = [NSMutableString string];
                     const NDIlib_source_t *pick = NULL;
                     for (uint32_t i = 0; i < n; i++) {
                         NSString *nm = srcs[i].p_ndi_name
                             ? [NSString stringWithUTF8String:srcs[i].p_ndi_name] : @"";
-                        if (!cfg.source.length) { pick = &srcs[i]; chosenName = nm; break; }
-                        if ([nm localizedCaseInsensitiveContainsString:cfg.source]) {
-                            pick = &srcs[i]; chosenName = nm; break;
+                        if (i < 6) [names appendFormat:@"%@%@", names.length ? @", " : @"", nm];
+                        if (!pick) {
+                            if (!cfg.source.length) { pick = &srcs[i]; chosenName = nm; }
+                            else if ([nm localizedCaseInsensitiveContainsString:cfg.source]) {
+                                pick = &srcs[i]; chosenName = nm;
+                            }
                         }
                     }
+                    writeStatsSearching(n, names, curExtraIps);
                     if (!pick) {
-                        // nothing matched yet; keep looping (find list updates over time)
                         for (int i = 0; i < 5 && !gReload; i++) [NSThread sleepForTimeInterval:0.1];
                         continue;
                     }
