@@ -13,13 +13,94 @@
 
 #import <Foundation/Foundation.h>
 #import <notify.h>
+#import <sys/mman.h>
+#import <sys/stat.h>
+#import <fcntl.h>
+#import <unistd.h>
+#import <stdatomic.h>
 #include "Processing.NDI.Lib.h"
+#include "VCamNDIShared.h"
 
 static NSString *const kConfigPlist = @"/var/mobile/Media/DCIM/vcam_ndi.plist";
 static NSString *const kStatsFile   = @"/var/mobile/Media/DCIM/vcam_ndi_stats.txt";
 static const char  *const kNoteReload = "com.vcamplus.ndi.reload";
 
 static volatile int gReload = 0;
+
+// ---- Shared-memory frame publisher ---------------------------------------
+// Maps VCAMNDI_PATH MAP_SHARED and writes decoded UYVY frames into a ring of slots
+// for the mediaserverd tweak to consume.
+typedef struct {
+    int fd;
+    uint8_t *base;          // mmap base (header page + ring slots)
+    VCamNDIHeader *hdr;
+    uint32_t writeIndex;    // next slot to write
+} VCamNDIPublisher;
+
+static BOOL pub_open(VCamNDIPublisher *p) {
+    memset(p, 0, sizeof(*p));
+    p->fd = open(VCAMNDI_PATH, O_RDWR | O_CREAT, 0644);
+    if (p->fd < 0) { NSLog(@"[vcam-ndi] shm open failed: %s", strerror(errno)); return NO; }
+    if (ftruncate(p->fd, (off_t)VCAMNDI_FILE_SIZE) != 0) {
+        NSLog(@"[vcam-ndi] ftruncate failed: %s", strerror(errno)); close(p->fd); p->fd = -1; return NO;
+    }
+    // World-readable so the _mediaserverd user can map it read-only.
+    fchmod(p->fd, 0644);
+    p->base = mmap(NULL, (size_t)VCAMNDI_FILE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, p->fd, 0);
+    if (p->base == MAP_FAILED) {
+        NSLog(@"[vcam-ndi] mmap failed: %s", strerror(errno)); close(p->fd); p->fd = -1; return NO;
+    }
+    p->hdr = (VCamNDIHeader *)p->base;
+    p->hdr->magic = 0; // mark uninitialized until first config
+    p->hdr->abi = VCAMNDI_ABI;
+    p->hdr->ringCount = VCAMNDI_RING;
+    p->hdr->slotBytes = VCAMNDI_SLOT_BYTES;
+    p->hdr->enabled = 0;
+    p->hdr->frameSeq = 0;
+    p->writeIndex = 0;
+    NSLog(@"[vcam-ndi] shm mapped (%llu bytes)", (unsigned long long)VCAMNDI_FILE_SIZE);
+    return YES;
+}
+
+static void pub_set_enabled(VCamNDIPublisher *p, BOOL on) {
+    if (p->hdr) p->hdr->enabled = on ? 1 : 0;
+}
+
+// Copy one decoded UYVY frame into the next ring slot and publish it.
+static void pub_write(VCamNDIPublisher *p, const NDIlib_video_frame_v2_t *vid) {
+    if (!p->hdr) return;
+    uint32_t w = (uint32_t)vid->xres, h = (uint32_t)vid->yres;
+    if (w == 0 || h == 0 || w > VCAMNDI_MAX_W || h > VCAMNDI_MAX_H) return; // over cap: skip
+    uint32_t rowBytes = w * 2;                 // packed UYVY destination
+    int srcStride = vid->line_stride_in_bytes ? vid->line_stride_in_bytes : (int)rowBytes;
+
+    uint32_t idx = p->writeIndex;
+    uint8_t *slot = p->base + vcamndi_slot_offset(idx);
+
+    const uint8_t *src = vid->p_data;
+    for (uint32_t y = 0; y < h; y++)
+        memcpy(slot + (size_t)y * rowBytes, src + (size_t)y * srcStride, rowBytes);
+
+    // Geometry change → bump configGen so the consumer re-reads dimensions.
+    if (p->hdr->width != w || p->hdr->height != h || p->hdr->magic != VCAMNDI_MAGIC) {
+        p->hdr->width = w; p->hdr->height = h;
+        p->hdr->rowBytes = rowBytes; p->hdr->fourcc = VCAMNDI_FOURCC_2VUY;
+        atomic_thread_fence(memory_order_release);
+        p->hdr->configGen = p->hdr->configGen + 1;
+        p->hdr->magic = VCAMNDI_MAGIC;
+    }
+
+    // Seqlock publish: odd = writing, even = stable.
+    uint64_t seq = p->hdr->frameSeq;
+    p->hdr->frameSeq = seq + 1;                 // -> odd
+    atomic_thread_fence(memory_order_release);
+    p->hdr->currentIndex = idx;
+    atomic_thread_fence(memory_order_release);
+    p->hdr->frameSeq = seq + 2;                 // -> even, new frame id
+
+    p->writeIndex = (idx + 1) % VCAMNDI_RING;
+}
+
 
 typedef struct {
     NSString *source;   // substring match, or nil
@@ -70,6 +151,10 @@ int main(int argc, char *argv[]) {
             [NSThread sleepForTimeInterval:30]; return 1;
         }
 
+        VCamNDIPublisher pub;
+        BOOL pubOK = pub_open(&pub);
+        if (!pubOK) NSLog(@"[vcam-ndi] continuing without shm publish");
+
         int token;
         notify_register_dispatch(kNoteReload, &token,
                                  dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
@@ -92,6 +177,7 @@ int main(int argc, char *argv[]) {
                 VCamNDIConfig cfg = readConfig();
 
                 if (!cfg.enabled) {
+                    if (pubOK) pub_set_enabled(&pub, NO);
                     writeStats(@"disabled", nil, 0, 0, 0, 0.0, framesTotal);
                     for (int i = 0; i < 10 && !gReload; i++) [NSThread sleepForTimeInterval:0.1];
                     continue;
@@ -160,6 +246,12 @@ int main(int argc, char *argv[]) {
                         if (type == NDIlib_frame_type_video) {
                             framesTotal++;
                             lastX = vid.xres; lastY = vid.yres; lastFourCC = (int)vid.FourCC;
+                            // Publish UYVY frames to the tweak. NDI "fastest" on SDR is UYVY;
+                            // other FourCCs (e.g. P216/BGRA) aren't bridged this milestone.
+                            if (pubOK && vid.FourCC == NDIlib_FourCC_type_UYVY) {
+                                pub_set_enabled(&pub, YES);
+                                pub_write(&pub, &vid);
+                            }
                             NDIlib_recv_free_video_v2(recv, &vid);   // free immediately
                         } else if (type == NDIlib_frame_type_error) {
                             stayConnected = NO;
@@ -182,6 +274,7 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
+                if (pubOK) pub_set_enabled(&pub, NO);
                 NDIlib_recv_destroy(recv);
             }
         }

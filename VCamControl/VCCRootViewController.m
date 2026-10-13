@@ -19,6 +19,7 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
 @interface VCCRootViewController () <UITableViewDataSource, UITableViewDelegate,
                                      UIDocumentPickerDelegate, PHPickerViewControllerDelegate>
 @property (nonatomic, strong) UILabel *statusLabel;
+@property (nonatomic, strong) UISegmentedControl *modeControl;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSArray<NSString *> *clips;   // absolute paths
 @property (nonatomic, copy)   NSString *currentSource;      // from kConfigPlist
@@ -52,7 +53,12 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
 #pragma mark - Header (status + action buttons)
 
 - (UIView *)buildHeader {
-    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 245)];
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 300)];
+
+    self.modeControl = [[UISegmentedControl alloc] initWithItems:@[@"File clip", @"NDI stream"]];
+    self.modeControl.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.modeControl addTarget:self action:@selector(modeChanged:)
+               forControlEvents:UIControlEventValueChanged];
 
     self.statusLabel = [[UILabel alloc] init];
     self.statusLabel.numberOfLines = 0;
@@ -74,12 +80,17 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
                                   color:UIColor.systemBlueColor];
     pick.translatesAutoresizingMaskIntoConstraints = NO;
 
+    [header addSubview:self.modeControl];
     [header addSubview:self.statusLabel];
     [header addSubview:buttons];
     [header addSubview:pick];
 
     [NSLayoutConstraint activateConstraints:@[
-        [self.statusLabel.topAnchor constraintEqualToAnchor:header.topAnchor constant:12],
+        [self.modeControl.topAnchor constraintEqualToAnchor:header.topAnchor constant:12],
+        [self.modeControl.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:20],
+        [self.modeControl.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-20],
+
+        [self.statusLabel.topAnchor constraintEqualToAnchor:self.modeControl.bottomAnchor constant:12],
         [self.statusLabel.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:20],
         [self.statusLabel.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-20],
 
@@ -211,8 +222,12 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     return dest;
 }
 
-- (void)selectClip:(NSString *)path {
-    NSDictionary *cfg = @{ @"source": path };
+// Merge keys into vcam_msd.plist (preserving e.g. "mode" when setting "source" and vice
+// versa). Returns NO (with an alert) if the write fails.
+- (BOOL)writeConfigMerging:(NSDictionary *)updates {
+    NSMutableDictionary *cfg =
+        [[NSDictionary dictionaryWithContentsOfFile:kConfigPlist] mutableCopy] ?: [NSMutableDictionary dictionary];
+    [cfg addEntriesFromDictionary:updates];
     NSError *err = nil;
     NSData *data = [NSPropertyListSerialization dataWithPropertyList:cfg
                                                              format:NSPropertyListXMLFormat_v1_0
@@ -221,20 +236,35 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
         [self alert:@"Could not write config"
             message:[NSString stringWithFormat:@"%@\n\nPath: %@\n\nThe app must be unsandboxed "
                       "(platform-application) to write here.", err.localizedDescription ?: @"write failed", kConfigPlist]];
-        return;
+        return NO;
     }
+    return YES;
+}
+
+- (void)selectClip:(NSString *)path {
+    if (![self writeConfigMerging:@{ @"source": path }]) return;
     self.currentSource = path;
     notify_post(kNoteReload.UTF8String);
     [self flash:[NSString stringWithFormat:@"Source → %@", path.lastPathComponent]];
     [self.tableView reloadData];
 }
 
+// File clip (0) vs NDI stream (1). Writes "mode" and reloads the tweak.
+- (void)modeChanged:(UISegmentedControl *)sender {
+    BOOL ndi = (sender.selectedSegmentIndex == 1);
+    if (![self writeConfigMerging:@{ @"mode": ndi ? @"ndi" : @"file" }]) return;
+    notify_post(kNoteReload.UTF8String);
+    [self flash:ndi ? @"Mode → NDI stream" : @"Mode → File clip"];
+}
+
 #pragma mark - Refresh / status
 
 - (void)refresh {
-    // Current source from the shared plist.
+    // Current source + mode from the shared plist.
     NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:kConfigPlist];
     self.currentSource = [cfg[@"source"] isKindOfClass:NSString.class] ? cfg[@"source"] : nil;
+    BOOL ndi = [[cfg[@"mode"] description] caseInsensitiveCompare:@"ndi"] == NSOrderedSame;
+    self.modeControl.selectedSegmentIndex = ndi ? 1 : 0;
 
     // Scan for candidate clips.
     NSMutableArray *found = [NSMutableArray array];

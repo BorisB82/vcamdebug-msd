@@ -6,6 +6,8 @@
 
 #import "VCamCore.h"
 #import "LocalVideoPlayer.h"
+#import "NDIShmSource.h"
+#import "VCamFrameSource.h"
 #import "GPUImageProcessor.h"
 
 #import <mach/mach_time.h>
@@ -46,7 +48,10 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
 @implementation VCamCore {
     _Atomic bool _enabled;          // driven by Darwin notifications, read on the emit hot path
     BOOL _playerStarted;
-    NSString *_sourcePath;          // current source; swappable at runtime via .reload
+    NSString *_sourcePath;          // current mp4 source; swappable at runtime via .reload
+    BOOL _ndiMode;                  // YES = pull frames from NDIShmSource, NO = mp4 player
+    NDIShmSource *_ndiSource;
+    __weak id<VCamFrameSource> _activeSource;  // -> _videoPlayer or _ndiSource
     dispatch_queue_t _ctrlQueue;    // serializes enable/disable/reload handling
     int _noteTokens[4];
     mach_timebase_info_data_t _tb;
@@ -81,6 +86,9 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
         _gpuProcessor = [GPUImageProcessor new];
         _sourcePath   = [[self configuredSourcePath] copy];
         _videoPlayer  = [[LocalVideoPlayer alloc] initWithPath:_sourcePath];
+        _ndiSource    = [NDIShmSource new];
+        _ndiMode      = [self configuredNDIMode];
+        _activeSource = _ndiMode ? (id<VCamFrameSource>)_ndiSource : (id<VCamFrameSource>)_videoPlayer;
         _ctrlQueue    = dispatch_queue_create("com.vcamplus.msd.control", DISPATCH_QUEUE_SERIAL);
 
         [self registerControlNotifications];
@@ -122,30 +130,48 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
     NSLog(@"[vcam-msd] control notifications registered (enable/disable/toggle/reload)");
 }
 
-// Runs on _ctrlQueue. Toggles the gate and starts/stops the decoder to match.
-- (void)applyEnabled:(BOOL)on {
-    if (on && !_playerStarted) {
-        [_videoPlayer start];
-        _playerStarted = YES;
-    } else if (!on && _playerStarted) {
-        [_videoPlayer stop];
-        _playerStarted = NO;
-    }
-    atomic_store(&_enabled, on);
-    NSLog(@"[vcam-msd] enabled=%d (source=%@)", on, _sourcePath);
+// Reads the frame-source mode from kVCamConfigPlist ({"mode": "ndi"} vs file/absent).
+- (BOOL)configuredNDIMode {
+    NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:kVCamConfigPlist];
+    NSString *m = [cfg[@"mode"] isKindOfClass:NSString.class] ? cfg[@"mode"] : nil;
+    return [m caseInsensitiveCompare:@"ndi"] == NSOrderedSame;
 }
 
-// Runs on _ctrlQueue. Re-reads the source path; if it changed, swaps the decoder's input
-// without dropping the enabled state.
-- (void)reloadSource {
-    NSString *next = [self configuredSourcePath];
-    if ([next isEqualToString:_sourcePath]) {
-        NSLog(@"[vcam-msd] reload: source unchanged (%@)", _sourcePath);
-        return;
+// Runs on _ctrlQueue. Sets the gate and reconciles the active source to match.
+- (void)applyEnabled:(BOOL)on {
+    atomic_store(&_enabled, on);
+    [self reconfigure];
+    NSLog(@"[vcam-msd] enabled=%d mode=%@ source=%@", on, _ndiMode ? @"ndi" : @"file", _sourcePath);
+}
+
+// Runs on _ctrlQueue. Re-reads mode + mp4 path and reconciles.
+- (void)reloadSource { [self reconfigure]; }
+
+// Runs on _ctrlQueue. Picks the source for the current mode, swaps it in if changed, and
+// starts/stops it to match the enabled gate.
+- (void)reconfigure {
+    BOOL ndi = [self configuredNDIMode];
+    _ndiMode = ndi;
+    id<VCamFrameSource> desired = ndi ? (id<VCamFrameSource>)_ndiSource
+                                      : (id<VCamFrameSource>)_videoPlayer;
+
+    if (!ndi) {  // keep the mp4 player's path current
+        NSString *next = [self configuredSourcePath];
+        if (![next isEqualToString:_sourcePath]) {
+            _sourcePath = [next copy];
+            [_videoPlayer setPath:_sourcePath];
+        }
     }
-    _sourcePath = [next copy];
-    [_videoPlayer setPath:_sourcePath];
-    NSLog(@"[vcam-msd] reload: source -> %@", _sourcePath);
+
+    if (_activeSource != desired) {             // mode changed: stop the old source
+        [_activeSource stop];
+        _playerStarted = NO;
+        _activeSource = desired;
+    }
+
+    BOOL on = atomic_load(&_enabled);
+    if (on && !_playerStarted)      { [_activeSource start]; _playerStarted = YES; }
+    else if (!on && _playerStarted) { [_activeSource stop];  _playerStarted = NO; }
 }
 
 - (void)dumpStats {
@@ -174,7 +200,7 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
                                        dateStyle:NSDateFormatterShortStyle
                                        timeStyle:NSDateFormatterMediumStyle]];
     [s appendFormat:@"playerStarted=%d enabled=%d\n", _playerStarted, atomic_load(&_enabled)];
-    [s appendFormat:@"source=%@\n", _sourcePath];
+    [s appendFormat:@"mode=%@ source=%@\n", _ndiMode ? @"ndi" : @"file", _ndiMode ? @"(ndi shm)" : _sourcePath];
     [s appendFormat:@"lastDst=%ux%u '%s' (0x%08x)\n", w, h, fcc, fmt];
     [s appendFormat:@"\n--- emit hit breakdown ---\n"];
     [s appendFormat:@"hitTotal:        %llu\n", atomic_load(&_hitTotal)];
@@ -246,13 +272,14 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
         return NO;
     }
 
-    uint64_t srcID = [_videoPlayer latestFrameID];
+    id<VCamFrameSource> source = _activeSource;
+    uint64_t srcID = [source latestFrameID];
     if (srcID == 0) {
         atomic_fetch_add_explicit(&_hitNoSrc, 1, memory_order_relaxed);
         return NO;
     }
 
-    CVPixelBufferRef srcFrame = [_videoPlayer latestFrameRetained];
+    CVPixelBufferRef srcFrame = [source latestFrameRetained];
     if (!srcFrame) {
         atomic_fetch_add_explicit(&_hitNoSrc, 1, memory_order_relaxed);
         return NO;

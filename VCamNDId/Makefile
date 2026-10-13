@@ -10,7 +10,7 @@ NDI_DIR = $(THEOS_PROJECT_DIR)/../third_party/NDI
 
 vcamndid_FILES        = main.m
 vcamndid_FRAMEWORKS   = Foundation CoreMedia CoreVideo VideoToolbox AudioToolbox Accelerate SystemConfiguration CFNetwork
-vcamndid_CFLAGS       = -fobjc-arc -I$(NDI_DIR)/include
+vcamndid_CFLAGS       = -fobjc-arc -I$(NDI_DIR)/include -I$(THEOS_PROJECT_DIR)/../common
 vcamndid_LDFLAGS      = -L$(NDI_DIR)/lib -lndi_ios -lc++
 vcamndid_CODESIGN_FLAGS = -Sentitlements.plist
 vcamndid_INSTALL_PATH = /usr/local/bin

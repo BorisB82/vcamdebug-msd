@@ -3,10 +3,11 @@
 
 #import <Foundation/Foundation.h>
 #import <CoreVideo/CoreVideo.h>
+#import "VCamFrameSource.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface LocalVideoPlayer : NSObject
+@interface LocalVideoPlayer : NSObject <VCamFrameSource>
 
 - (instancetype)initWithPath:(NSString *)path;
 
