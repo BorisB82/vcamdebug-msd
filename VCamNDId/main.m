@@ -140,6 +140,41 @@ static void writeStats(NSString *state, NSString *sourceName,
     [s writeToFile:kStatsFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
+// Richer stats for the live connection: adds receive/drop/queue + arrival jitter + thermal
+// so network vs CPU vs code can be told apart.
+static void writeStatsConnected(NSString *sourceName, int xres, int yres, int fourcc,
+                                double fps, unsigned long long frames,
+                                long long recvTotal, long long recvDropped, long long droppedDelta,
+                                int queueDepth, double maxGapMs) {
+    char fcc[5] = {0}; fourccToStr(fourcc, fcc);
+    const char *thermal = "nominal";
+    switch (NSProcessInfo.processInfo.thermalState) {
+        case NSProcessInfoThermalStateFair:     thermal = "fair"; break;
+        case NSProcessInfoThermalStateSerious:  thermal = "serious"; break;
+        case NSProcessInfoThermalStateCritical: thermal = "critical"; break;
+        default: break;
+    }
+    NSMutableString *s = [NSMutableString stringWithCapacity:640];
+    [s appendFormat:@"=== vcam-ndi milestone2 @ %@ ===\n",
+        [NSDateFormatter localizedStringFromDate:NSDate.date
+                                       dateStyle:NSDateFormatterShortStyle
+                                       timeStyle:NSDateFormatterMediumStyle]];
+    [s appendFormat:@"state=%@\n", frames ? @"connected" : @"connected-nodata"];
+    [s appendFormat:@"source=%@\n", sourceName.length ? sourceName : @"(none)"];
+    [s appendFormat:@"frame=%dx%d fourcc=%s\n", xres, yres, fcc];
+    [s appendFormat:@"publishFps=%.2f framesTotal=%llu\n", fps, frames];
+    [s appendFormat:@"--- receive health ---\n"];
+    [s appendFormat:@"recvTotal=%lld recvDropped=%lld droppedThisSec=%lld\n",
+        recvTotal, recvDropped, droppedDelta];
+    [s appendFormat:@"queueDepth=%d  maxArrivalGapMs=%.1f\n", queueDepth, maxGapMs];
+    [s appendFormat:@"thermalState=%s\n", thermal];
+    [s appendFormat:@"--- how to read ---\n"];
+    [s appendFormat:@"droppedThisSec>0  -> frames lost (network or we drain too slow)\n"];
+    [s appendFormat:@"queueDepth rising -> daemon decode/copy too slow (CPU)\n"];
+    [s appendFormat:@"maxGapMs >> 33    -> network stall/jitter (bursty delivery)\n"];
+    [s writeToFile:kStatsFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         NSLog(@"[vcam-ndi] starting");
@@ -236,6 +271,8 @@ int main(int argc, char *argv[]) {
                 int lastX = 0, lastY = 0, lastFourCC = 0;
                 double measuredFps = 0.0;
                 BOOL stayConnected = YES;
+                double lastArrival = 0.0, maxGapMs = 0.0;   // inter-frame jitter in window
+                long long droppedAtLastStat = 0;
 
                 while (stayConnected && !gReload) {
                     @autoreleasepool {
@@ -246,6 +283,12 @@ int main(int argc, char *argv[]) {
                         if (type == NDIlib_frame_type_video) {
                             framesTotal++;
                             lastX = vid.xres; lastY = vid.yres; lastFourCC = (int)vid.FourCC;
+                            double nowA = NSProcessInfo.processInfo.systemUptime;
+                            if (lastArrival > 0.0) {
+                                double gap = (nowA - lastArrival) * 1000.0;
+                                if (gap > maxGapMs) maxGapMs = gap;
+                            }
+                            lastArrival = nowA;
                             // Publish UYVY frames to the tweak. NDI "fastest" on SDR is UYVY;
                             // other FourCCs (e.g. P216/BGRA) aren't bridged this milestone.
                             if (pubOK && vid.FourCC == NDIlib_FourCC_type_UYVY) {
@@ -261,11 +304,21 @@ int main(int argc, char *argv[]) {
                         double now = NSProcessInfo.processInfo.systemUptime;
                         if (now - lastStat >= 1.0) {
                             measuredFps = (double)(framesTotal - framesAtLastStat) / (now - lastStat);
-                            BOOL live = (framesTotal > framesAtLastStat);
-                            writeStats(live ? @"connected" : @"connected-nodata",
-                                       chosenName, lastX, lastY, lastFourCC,
-                                       measuredFps, framesTotal);
+
+                            NDIlib_recv_performance_t tot = {0}, drop = {0};
+                            NDIlib_recv_get_performance(recv, &tot, &drop);
+                            NDIlib_recv_queue_t q = {0};
+                            NDIlib_recv_get_queue(recv, &q);
+                            long long dropDelta = drop.video_frames - droppedAtLastStat;
+
+                            writeStatsConnected(chosenName, lastX, lastY, lastFourCC,
+                                                measuredFps, framesTotal,
+                                                tot.video_frames, drop.video_frames, dropDelta,
+                                                q.video_frames, maxGapMs);
+
                             lastStat = now; framesAtLastStat = framesTotal;
+                            droppedAtLastStat = drop.video_frames;
+                            maxGapMs = 0.0;   // reset jitter window
 
                             // Re-read config so enabled=false / source change takes effect.
                             VCamNDIConfig c2 = readConfig();

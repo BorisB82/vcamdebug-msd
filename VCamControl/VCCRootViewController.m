@@ -300,10 +300,19 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     NSString *ndi = [NSString stringWithContentsOfFile:kNDIStatsFile encoding:NSUTF8StringEncoding error:nil];
     NSString *ndiLine;
     if (ndi.length) {
-        ndiLine = [NSString stringWithFormat:@"NDI: %@  %@  %@fps",
+        NSString *fps = [self valueFor:@"publishFps=" in:ndi] ?: [self valueFor:@"fps=" in:ndi] ?: @"?";
+        ndiLine = [NSString stringWithFormat:@"NDI: %@ %@ %@fps",
                    [self valueFor:@"state=" in:ndi] ?: @"?",
                    [self valueFor:@"frame=" in:ndi] ?: @"",
-                   [self valueFor:@"fps=" in:ndi] ?: @"?"];
+                   fps];
+        NSString *drop = [self valueFor:@"droppedThisSec=" in:ndi];
+        if (drop) {  // milestone-2 diagnostics present
+            ndiLine = [ndiLine stringByAppendingFormat:@"\n  drop/s=%@ q=%@ gap=%@ms %@",
+                       drop,
+                       [self valueFor:@"queueDepth=" in:ndi] ?: @"?",
+                       [self valueFor:@"maxArrivalGapMs=" in:ndi] ?: @"?",
+                       [self valueFor:@"thermalState=" in:ndi] ?: @""];
+        }
     } else {
         ndiLine = @"NDI: daemon not running";
     }
