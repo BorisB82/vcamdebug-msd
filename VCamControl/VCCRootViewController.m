@@ -292,7 +292,6 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
 - (void)updateStatusLabel {
     NSString *stats = [NSString stringWithContentsOfFile:kStatsFile encoding:NSUTF8StringEncoding error:nil];
     NSString *enabled = [self valueFor:@"enabled=" in:stats] ?: @"?";
-    NSString *player  = [self valueFor:@"playerStarted=" in:stats] ?: @"?";
     NSString *src     = self.currentSource.lastPathComponent ?: @"(none)";
     BOOL statsSeen    = stats.length > 0;
 
