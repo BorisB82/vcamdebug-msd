@@ -70,6 +70,8 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
 
     _Atomic int _rotation;
     _Atomic uint64_t _renderCount, _renderTotalNs, _renderMaxNs, _hitCount, _failCount;
+    _Atomic uint64_t _renderPasses;     // source frames that rendered >=1 geometry
+    _Atomic uint64_t _maxGeomsPerPass;  // peak geometries rendered in one source frame
 }
 
 - (instancetype)init {
@@ -134,6 +136,7 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
     }];
     os_unfair_lock_unlock(&_lock);
 
+    uint64_t renderedThisPass = 0;
     for (VCamGeom *g in live) {
         os_unfair_lock_lock(&_lock);
         int idx = g->poolIdx;
@@ -159,18 +162,34 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
         uint64_t prev = atomic_load_explicit(&_renderMaxNs, memory_order_relaxed);
         while (dt > prev && !atomic_compare_exchange_weak_explicit(&_renderMaxNs, &prev, dt,
                    memory_order_relaxed, memory_order_relaxed)) {}
+        renderedThisPass++;
 
         os_unfair_lock_lock(&_lock);
         g->ready = buf; g->readySrcID = srcID; g->renders++;
         g->poolIdx = (idx + 1) % VCAM_GEOM_POOL;   // next render uses a different slot
         os_unfair_lock_unlock(&_lock);
     }
+
+    // Measure concurrency: how many geometries we actually render per source frame.
+    if (renderedThisPass > 0) {
+        atomic_fetch_add_explicit(&_renderPasses, 1, memory_order_relaxed);
+        uint64_t prevMax = atomic_load_explicit(&_maxGeomsPerPass, memory_order_relaxed);
+        while (renderedThisPass > prevMax &&
+               !atomic_compare_exchange_weak_explicit(&_maxGeomsPerPass, &prevMax, renderedThisPass,
+                   memory_order_relaxed, memory_order_relaxed)) {}
+    }
 }
 
 // A one-line-per-geometry report of everything flowing through the hook, so we can see which
 // buffer sizes/formats the pipeline actually emits (and how often) vs which we render.
 - (NSString *)geometryReport {
-    NSMutableString *s = [NSMutableString stringWithString:@"--- dst geometries seen ---\n"];
+    uint64_t passes = atomic_load_explicit(&_renderPasses, memory_order_relaxed);
+    uint64_t renders = atomic_load_explicit(&_renderCount, memory_order_relaxed);
+    double perFrame = passes ? (double)renders / passes : 0.0;
+    NSMutableString *s = [NSMutableString stringWithFormat:
+        @"--- render concurrency ---\nsourceFramesRendered=%llu geomsPerFrame avg=%.2f max=%llu\n"
+        @"--- dst geometries seen ---\n",
+        passes, perFrame, atomic_load_explicit(&_maxGeomsPerPass, memory_order_relaxed)];
     os_unfair_lock_lock(&_lock);
     [_geoms enumerateKeysAndObjectsUsingBlock:^(NSString *k, VCamGeom *g, BOOL *stop) {
         char fcc[5] = {0};
