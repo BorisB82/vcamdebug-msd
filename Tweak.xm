@@ -14,6 +14,7 @@
 #import <stdatomic.h>
 
 #import "VCamCore.h"
+#import "VCamRecorder.h"
 
 typedef void (*EmitFn)(id, SEL, CMSampleBufferRef);
 
@@ -37,8 +38,12 @@ static void hooked_emit(id _self, SEL sel, CMSampleBufferRef sb) {
     atomic_store_explicit(&gFirstClassReachedHook, 1, memory_order_relaxed);
     @autoreleasepool {
         @try {
-            if (sb && [VCamCore.shared isEnabled]) {
-                [VCamCore.shared replaceInPlace:sb];
+            if (sb) {
+                // Record the REAL frame first (no-op unless armed), then optionally replace it.
+                [VCamRecorder.shared observeSampleBuffer:sb];
+                if ([VCamCore.shared isEnabled]) {
+                    [VCamCore.shared replaceInPlace:sb];
+                }
             }
         } @catch (NSException *e) {
             NSLog(@"[vcam-msd] emit hook exception: %@", e);
@@ -132,10 +137,11 @@ static void vcamplus_msd_init(void) {
     @autoreleasepool {
         NSString *proc = NSProcessInfo.processInfo.processName;
         if (![proc isEqualToString:@"mediaserverd"]) return;
-        NSLog(@"[vcam-msd] LOADED in mediaserverd (build 0.7.6, broad subclass hook)");
+        NSLog(@"[vcam-msd] LOADED in mediaserverd (build 0.9.0, broad subclass hook + HEVC recorder)");
         NSLog(@"[vcam-msd] To activate: touch /var/mobile/Media/DCIM/vcam_msd_active");
         NSLog(@"[vcam-msd] Stats: /var/mobile/Media/DCIM/vcam_msd_stats.txt (every 5s)");
         (void)[VCamCore shared];
+        (void)[VCamRecorder shared];   // register rec.start/.stop/.toggle notes early
 
         if (try_install()) return;
 

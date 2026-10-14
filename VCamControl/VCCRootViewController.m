@@ -1,4 +1,6 @@
 #import "VCCRootViewController.h"
+#import "VCCAppDelegate.h"
+#import "VCCRec.h"
 #import <notify.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <PhotosUI/PhotosUI.h>
@@ -20,6 +22,7 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
                                      UIDocumentPickerDelegate, PHPickerViewControllerDelegate>
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UISegmentedControl *modeControl;
+@property (nonatomic, strong) UIButton *recordButton;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSArray<NSString *> *clips;   // absolute paths
 @property (nonatomic, copy)   NSString *currentSource;      // from kConfigPlist
@@ -46,7 +49,14 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
     [self.tableView registerClass:UITableViewCell.class forCellReuseIdentifier:@"clip"];
     self.tableView.tableHeaderView = [self buildHeader];
     [self.view addSubview:self.tableView];
+
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(recStateChanged)
+                                               name:kRecStateDidChange object:nil];
 }
+
+- (void)dealloc { [NSNotificationCenter.defaultCenter removeObserver:self]; }
+
+- (void)recStateChanged { [self updateRecordButton]; [self refreshStatusSoon]; }
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
@@ -56,7 +66,7 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
 #pragma mark - Header (status + action buttons)
 
 - (UIView *)buildHeader {
-    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 300)];
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 420)];
 
     self.modeControl = [[UISegmentedControl alloc] initWithItems:@[@"File clip", @"NDI stream"]];
     self.modeControl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -83,10 +93,23 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
                                   color:UIColor.systemBlueColor];
     pick.translatesAutoresizingMaskIntoConstraints = NO;
 
+    // Recorder row: a direct Record/Stop toggle, plus a button that posts the interactive
+    // notification so recording can be controlled from the lock screen / Notification Center.
+    self.recordButton = [self actionButton:@"● Record" sel:@selector(tapRecord)
+                                     color:UIColor.systemRedColor];
+    UIButton *notif = [self actionButton:@"Lock-screen controls" sel:@selector(tapPostNotification)
+                                   color:UIColor.systemIndigoColor];
+    UIStackView *recRow = [[UIStackView alloc] initWithArrangedSubviews:@[self.recordButton, notif]];
+    recRow.axis = UILayoutConstraintAxisHorizontal;
+    recRow.distribution = UIStackViewDistributionFillEqually;
+    recRow.spacing = 10;
+    recRow.translatesAutoresizingMaskIntoConstraints = NO;
+
     [header addSubview:self.modeControl];
     [header addSubview:self.statusLabel];
     [header addSubview:buttons];
     [header addSubview:pick];
+    [header addSubview:recRow];
 
     [NSLayoutConstraint activateConstraints:@[
         [self.modeControl.topAnchor constraintEqualToAnchor:header.topAnchor constant:12],
@@ -106,7 +129,12 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
         [pick.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:20],
         [pick.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-20],
         [pick.heightAnchor constraintEqualToConstant:46],
-        [pick.bottomAnchor constraintLessThanOrEqualToAnchor:header.bottomAnchor constant:-12],
+
+        [recRow.topAnchor constraintEqualToAnchor:pick.bottomAnchor constant:10],
+        [recRow.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:20],
+        [recRow.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-20],
+        [recRow.heightAnchor constraintEqualToConstant:46],
+        [recRow.bottomAnchor constraintLessThanOrEqualToAnchor:header.bottomAnchor constant:-12],
     ]];
     return header;
 }
@@ -127,6 +155,30 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
 - (void)tapEnable  { notify_post(kNoteEnable.UTF8String);  [self flash:@"Enabled"];  [self refreshStatusSoon]; }
 - (void)tapDisable { notify_post(kNoteDisable.UTF8String); [self flash:@"Disabled"]; [self refreshStatusSoon]; }
 - (void)tapToggle  { notify_post(kNoteToggle.UTF8String);  [self flash:@"Toggled"];  [self refreshStatusSoon]; }
+
+// Record / Stop. Reads the current tweak state so the button maps to an explicit start or stop.
+- (void)tapRecord {
+    BOOL recording = VCCRecIsRecording();
+    notify_post((recording ? kNoteRecStop : kNoteRecStart).UTF8String);
+    [self flash:recording ? @"Recording stopped" : @"Recording…"];
+    // Keep the lock-screen control in sync with the new intent.
+    [VCCAppDelegate presentRecordingNotificationRecording:!recording];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [self updateRecordButton]; });
+    [self refreshStatusSoon];
+}
+
+// Surface the interactive notification so recording can be driven from the lock screen.
+- (void)tapPostNotification {
+    [VCCAppDelegate presentRecordingNotificationRecording:VCCRecIsRecording()];
+    [self flash:@"Control notification posted"];
+}
+
+- (void)updateRecordButton {
+    BOOL recording = VCCRecIsRecording();
+    [self.recordButton setTitle:recording ? @"■ Stop" : @"● Record" forState:UIControlStateNormal];
+    self.recordButton.backgroundColor = recording ? UIColor.systemGrayColor : UIColor.systemRedColor;
+}
 
 // Offer both sources: Photos (AirDropped / camera-roll clips live here, invisible to the
 // Files picker) and Files (iCloud Drive / On My iPhone / other providers).
@@ -294,6 +346,7 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
         [found insertObject:self.currentSource atIndex:0];
     self.clips = found;
 
+    [self updateRecordButton];
     [self updateStatusLabel];
     [self.tableView reloadData];
 }
@@ -337,10 +390,22 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
         ? [NSString stringWithFormat:@"\nemitFps=%@ freshFps=%@ (real update rate)", emit ?: @"?", fresh ?: @"?"]
         : @"";
 
+    // Recorder line from the tweak's dedicated status file: state + the detail line under it.
+    NSString *recRaw = [NSString stringWithContentsOfFile:kRecStatusFile
+                                                 encoding:NSUTF8StringEncoding error:nil];
+    NSString *recLine = @"rec: idle";
+    if (recRaw.length) {
+        NSString *recState = [self valueFor:@"state=" in:recRaw] ?: @"?";
+        NSArray *lines = [recRaw componentsSeparatedByString:@"\n"];
+        NSString *detail = lines.count > 1 ? lines[1] : @"";
+        recLine = detail.length ? [NSString stringWithFormat:@"rec: %@ — %@", recState, detail]
+                                : [NSString stringWithFormat:@"rec: %@", recState];
+    }
+
     self.statusLabel.text = [NSString stringWithFormat:
-        @"tweak: %@  enabled=%@  mode=%@%@\nsource: %@\n%@",
+        @"tweak: %@  enabled=%@  mode=%@%@\nsource: %@\n%@\n%@",
         statsSeen ? @"present" : @"not found (open Camera once)",
-        enabled, [self valueFor:@"mode=" in:stats] ?: @"?", rateLine, src, ndiLine];
+        enabled, [self valueFor:@"mode=" in:stats] ?: @"?", rateLine, src, ndiLine, recLine];
 }
 
 // Pulls the token immediately after `key` up to whitespace from the stats text.

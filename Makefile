@@ -5,7 +5,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = vcamplus-msd
 
-vcamplus-msd_FILES      = Tweak.xm VCamCore.m LocalVideoPlayer.m NDIShmSource.m GPUImageProcessor.m
+vcamplus-msd_FILES      = Tweak.xm VCamCore.m LocalVideoPlayer.m NDIShmSource.m GPUImageProcessor.m VCamRecorder.m
 vcamplus-msd_LDFLAGS    = -Wl,-x -Wl,-S -lsubstrate
 vcamplus-msd_FRAMEWORKS = AVFoundation CoreMedia CoreVideo VideoToolbox CoreImage Foundation IOSurface ImageIO Accelerate Metal
 vcamplus-msd_ARCHS      = arm64 arm64e

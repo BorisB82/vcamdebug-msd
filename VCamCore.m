@@ -9,6 +9,7 @@
 #import "NDIShmSource.h"
 #import "VCamFrameSource.h"
 #import "GPUImageProcessor.h"
+#import "VCamRecorder.h"
 
 #import <mach/mach_time.h>
 #import <sys/stat.h>
@@ -302,6 +303,7 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
         atomic_load(&gFirstClassReachedHook)];
     [s appendString:@"\n"];
     [s appendString:[_gpuProcessor geometryReport]];
+    [s appendString:[[VCamRecorder shared] statusReport]];
     [s writeToFile:kVCamStatsFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
