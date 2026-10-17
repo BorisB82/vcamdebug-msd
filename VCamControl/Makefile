@@ -8,7 +8,7 @@ APPLICATION_NAME = VCamControl
 
 VCamControl_FILES        = main.m VCCAppDelegate.m VCCRootViewController.m
 VCamControl_FRAMEWORKS   = UIKit Foundation UniformTypeIdentifiers PhotosUI UserNotifications
-VCamControl_CFLAGS       = -fobjc-arc
+VCamControl_CFLAGS       = -fobjc-arc -Wno-deprecated-declarations
 VCamControl_CODESIGN_FLAGS = -Sentitlements.plist
 
 include $(THEOS_MAKE_PATH)/application.mk

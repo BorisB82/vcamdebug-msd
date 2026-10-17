@@ -73,11 +73,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
        willPresentNotification:(UNNotification *)notification
          withCompletionHandler:(void (^)(UNNotificationPresentationOptions))completionHandler {
-    if (@available(iOS 14.0, *)) {
-        completionHandler(UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionList);
-    } else {
-        completionHandler(UNNotificationPresentationOptionAlert);
-    }
+    completionHandler(UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionList);
 }
 
 // An action was tapped. Drive the tweak via Darwin note, then re-post the notification reflecting
