@@ -4,6 +4,7 @@
 #import <notify.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <PhotosUI/PhotosUI.h>
+#import <UserNotifications/UserNotifications.h>
 
 // Must match VCamCore.m in the tweak.
 static NSString *const kConfigPlist = @"/var/mobile/Media/DCIM/vcam_msd.plist";
@@ -23,6 +24,7 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UISegmentedControl *modeControl;
 @property (nonatomic, strong) UIButton *recordButton;
+@property (nonatomic, strong) UIButton *targetButton;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSArray<NSString *> *clips;   // absolute paths
 @property (nonatomic, copy)   NSString *currentSource;      // from kConfigPlist
@@ -66,7 +68,7 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
 #pragma mark - Header (status + action buttons)
 
 - (UIView *)buildHeader {
-    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 420)];
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 480)];
 
     self.modeControl = [[UISegmentedControl alloc] initWithItems:@[@"File clip", @"NDI stream"]];
     self.modeControl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -105,11 +107,17 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
     recRow.spacing = 10;
     recRow.translatesAutoresizingMaskIntoConstraints = NO;
 
+    // Which pipeline geometry to record (parsed from the tweak's geometry report). Auto = largest.
+    self.targetButton = [self actionButton:@"Rec res: Auto (largest)" sel:@selector(tapChooseTarget)
+                                      color:UIColor.systemTealColor];
+    self.targetButton.translatesAutoresizingMaskIntoConstraints = NO;
+
     [header addSubview:self.modeControl];
     [header addSubview:self.statusLabel];
     [header addSubview:buttons];
     [header addSubview:pick];
     [header addSubview:recRow];
+    [header addSubview:self.targetButton];
 
     [NSLayoutConstraint activateConstraints:@[
         [self.modeControl.topAnchor constraintEqualToAnchor:header.topAnchor constant:12],
@@ -134,7 +142,12 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
         [recRow.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:20],
         [recRow.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-20],
         [recRow.heightAnchor constraintEqualToConstant:46],
-        [recRow.bottomAnchor constraintLessThanOrEqualToAnchor:header.bottomAnchor constant:-12],
+
+        [self.targetButton.topAnchor constraintEqualToAnchor:recRow.bottomAnchor constant:10],
+        [self.targetButton.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:20],
+        [self.targetButton.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-20],
+        [self.targetButton.heightAnchor constraintEqualToConstant:46],
+        [self.targetButton.bottomAnchor constraintLessThanOrEqualToAnchor:header.bottomAnchor constant:-12],
     ]];
     return header;
 }
@@ -168,16 +181,104 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
     [self refreshStatusSoon];
 }
 
-// Surface the interactive notification so recording can be driven from the lock screen.
+// Surface the interactive notification so recording can be driven from the lock screen. Checks
+// authorization first so "accepted but nothing appears" gives a clear reason.
 - (void)tapPostNotification {
-    [VCCAppDelegate presentRecordingNotificationRecording:VCCRecIsRecording()];
-    [self flash:@"Control notification posted"];
+    UNUserNotificationCenter *c = UNUserNotificationCenter.currentNotificationCenter;
+    [c getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *st) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BOOL ok = st.authorizationStatus == UNAuthorizationStatusAuthorized ||
+                      st.authorizationStatus == UNAuthorizationStatusProvisional;
+            if (!ok) {
+                [self alert:@"Notifications not allowed"
+                    message:@"Enable notifications for VCam Control in Settings → Notifications, "
+                            "then tap this again. (The in-app Record button works regardless.)"];
+                return;
+            }
+            [VCCAppDelegate presentRecordingNotificationRecording:VCCRecIsRecording()];
+            [self flash:@"Control posted — pull down the banner for Start/Stop"];
+        });
+    }];
 }
 
 - (void)updateRecordButton {
     BOOL recording = VCCRecIsRecording();
     [self.recordButton setTitle:recording ? @"■ Stop" : @"● Record" forState:UIControlStateNormal];
     self.recordButton.backgroundColor = recording ? UIColor.systemGrayColor : UIColor.systemRedColor;
+}
+
+#pragma mark - Record resolution target
+
+// Read the chosen record geometry from the plist; returns a short label ("Auto (largest)" or
+// "1920x1080 420v").
+- (NSString *)currentTargetLabel {
+    NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:kConfigPlist];
+    long w = [cfg[@"recW"] longValue], h = [cfg[@"recH"] longValue];
+    NSString *fmt = [cfg[@"recFmt"] isKindOfClass:NSString.class] ? cfg[@"recFmt"] : nil;
+    if (w > 0 && h > 0 && fmt.length == 4) return [NSString stringWithFormat:@"%ldx%ld %@", w, h, fmt];
+    return @"Auto (largest)";
+}
+
+- (void)updateTargetButton {
+    [self.targetButton setTitle:[NSString stringWithFormat:@"Rec res: %@", [self currentTargetLabel]]
+                       forState:UIControlStateNormal];
+}
+
+// Parse the "--- dst geometries seen ---" lines from the tweak stats into {w,h,fmt,emits}.
+- (NSArray<NSDictionary *> *)parseGeometries {
+    NSString *stats = [NSString stringWithContentsOfFile:kStatsFile encoding:NSUTF8StringEncoding error:nil];
+    if (!stats.length) return @[];
+    NSError *e = nil;
+    NSRegularExpression *re =
+        [NSRegularExpression regularExpressionWithPattern:@"(\\d+)x(\\d+) '([^']+)': emits=(\\d+)"
+                                                  options:0 error:&e];
+    NSMutableArray *out = [NSMutableArray array];
+    [re enumerateMatchesInString:stats options:0 range:NSMakeRange(0, stats.length)
+                      usingBlock:^(NSTextCheckingResult *m, NSMatchingFlags f, BOOL *stop) {
+        if (m.numberOfRanges < 5) return;
+        NSInteger w = [[stats substringWithRange:[m rangeAtIndex:1]] integerValue];
+        NSInteger h = [[stats substringWithRange:[m rangeAtIndex:2]] integerValue];
+        NSString *fmt = [stats substringWithRange:[m rangeAtIndex:3]];
+        NSInteger emits = [[stats substringWithRange:[m rangeAtIndex:4]] integerValue];
+        if (fmt.length == 4) [out addObject:@{@"w":@(w), @"h":@(h), @"fmt":fmt, @"emits":@(emits)}];
+    }];
+    // Busiest feed first — most-emitted is the most useful default to eyeball.
+    [out sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [b[@"emits"] compare:a[@"emits"]];
+    }];
+    return out;
+}
+
+- (void)tapChooseTarget {
+    NSArray<NSDictionary *> *geoms = [self parseGeometries];
+    UIAlertController *sheet =
+        [UIAlertController alertControllerWithTitle:@"Record which feed?"
+                                            message:(geoms.count ? @"Pipeline geometries seen this session (open the Camera first if empty)."
+                                                                 : @"No geometries reported yet — open the Camera, then try again.")
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Auto (largest feed)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) { [self setTargetW:0 h:0 fmt:@""]; }]];
+    for (NSDictionary *g in geoms) {
+        NSString *title = [NSString stringWithFormat:@"%@x%@ %@  (emits=%@)",
+                           g[@"w"], g[@"h"], g[@"fmt"], g[@"emits"]];
+        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *a) {
+            [self setTargetW:[g[@"w"] longValue] h:[g[@"h"] longValue] fmt:g[@"fmt"]];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    sheet.popoverPresentationController.sourceView = self.targetButton;
+    sheet.popoverPresentationController.sourceRect = self.targetButton.bounds;
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+// Writes recW/recH/recFmt (0/empty = auto). The recorder reads these on the next Record.
+- (void)setTargetW:(long)w h:(long)h fmt:(NSString *)fmt {
+    if (![self writeConfigMerging:@{ @"recW": @(w), @"recH": @(h), @"recFmt": fmt ?: @"" }]) return;
+    [self updateTargetButton];
+    [self flash:(w > 0 ? [NSString stringWithFormat:@"Rec res → %ldx%ld %@", w, h, fmt] : @"Rec res → Auto")];
 }
 
 // Offer both sources: Photos (AirDropped / camera-roll clips live here, invisible to the
@@ -347,6 +448,7 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     self.clips = found;
 
     [self updateRecordButton];
+    [self updateTargetButton];
     [self updateStatusLabel];
     [self.tableView reloadData];
 }

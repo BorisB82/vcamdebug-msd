@@ -15,10 +15,19 @@
 
 static NSString *const kRecStatusFile = @"/var/mobile/Media/DCIM/vcam_rec_status.txt";
 static NSString *const kRecDir        = @"/var/mobile/Media/DCIM";
+static NSString *const kRecConfigPlist = @"/var/mobile/Media/DCIM/vcam_msd.plist";
 
 static NSString *const kNoteRecStart  = @"com.vcamplus.rec.start";
 static NSString *const kNoteRecStop   = @"com.vcamplus.rec.stop";
 static NSString *const kNoteRecToggle = @"com.vcamplus.rec.toggle";
+
+// Build an OSType from a 4-char fourcc string like "420v" (as printed in the geometry report).
+static OSType vcam_fourccFromString(NSString *s) {
+    if (s.length != 4) return 0;
+    const char *c = s.UTF8String;
+    return ((OSType)(uint8_t)c[0] << 24) | ((OSType)(uint8_t)c[1] << 16) |
+           ((OSType)(uint8_t)c[2] << 8)  |  (OSType)(uint8_t)c[3];
+}
 
 // How long to watch the emitted geometries before locking onto the largest (the master feed).
 #define VCAM_REC_PROBE_SEC   0.5
@@ -85,9 +94,15 @@ static CVPixelBufferRef vcam_copyPixelBuffer(CVPixelBufferRef src) {
     // Chosen geometry (written on _recQueue before _locked is released; read on emit thread after).
     size_t _lockW, _lockH; OSType _lockFmt;
 
+    // Explicit target geometry from the config plist (recW/recH/recFmt). When set, we lock onto it
+    // immediately with no probe. Touched only on _recQueue.
+    BOOL _hasTarget; size_t _targetW, _targetH; OSType _targetFmt;
+
     // Probe candidate (largest geometry seen), guarded by _candLock.
     os_unfair_lock _candLock;
     uint64_t _candPixels; size_t _candW, _candH; OSType _candFmt;
+
+    _Atomic int _writerStatus;      // snapshot of AVAssetWriterStatus for the stats dump
 
     // Writer state — touched only on _recQueue.
     AVAssetWriter *_writer;
@@ -99,6 +114,7 @@ static CVPixelBufferRef vcam_copyPixelBuffer(CVPixelBufferRef src) {
     CMTime _firstPTS, _lastPTS;
 
     // Session counters.
+    _Atomic uint64_t _framesSeen;   // frames matching the locked geometry (vs notReady = stall)
     _Atomic uint64_t _framesWritten, _framesNotReady, _framesAppendFail;
     _Atomic uint64_t _framesDroppedInflight, _framesCopyFail;
 }
@@ -144,13 +160,24 @@ static CVPixelBufferRef vcam_copyPixelBuffer(CVPixelBufferRef src) {
     [self writeStatus:@"arming" extra:@"probing for largest feed…"];
     dispatch_async(_recQueue, ^{
         [self resetWriterState];
-        atomic_store(&_framesWritten, 0);        atomic_store(&_framesNotReady, 0);
-        atomic_store(&_framesAppendFail, 0);     atomic_store(&_framesDroppedInflight, 0);
-        atomic_store(&_framesCopyFail, 0);
+        atomic_store(&_framesSeen, 0);           atomic_store(&_framesWritten, 0);
+        atomic_store(&_framesNotReady, 0);       atomic_store(&_framesAppendFail, 0);
+        atomic_store(&_framesDroppedInflight, 0);atomic_store(&_framesCopyFail, 0);
         os_unfair_lock_lock(&_candLock);
         _candPixels = 0; _candW = _candH = 0; _candFmt = 0;
         os_unfair_lock_unlock(&_candLock);
-        [self scheduleProbeForGen:gen];
+
+        // Explicit target from the control app (recW/recH/recFmt) → lock immediately, no probe.
+        NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:kRecConfigPlist];
+        long tw = [cfg[@"recW"] longValue], th = [cfg[@"recH"] longValue];
+        OSType tf = vcam_fourccFromString([cfg[@"recFmt"] description]);
+        if (tw > 0 && th > 0 && tf != 0) {
+            _hasTarget = YES; _targetW = (size_t)tw; _targetH = (size_t)th; _targetFmt = tf;
+            [self buildWriterW:_targetW h:_targetH fmt:_targetFmt];   // ready before any frame
+        } else {
+            _hasTarget = NO;
+            [self scheduleProbeForGen:gen];
+        }
     });
 }
 
@@ -178,6 +205,7 @@ static CVPixelBufferRef vcam_copyPixelBuffer(CVPixelBufferRef src) {
         return;
     }
     if (w != _lockW || h != _lockH || fmt != _lockFmt) return;   // only the locked geometry
+    atomic_fetch_add_explicit(&_framesSeen, 1, memory_order_relaxed);
 
     if (atomic_load_explicit(&_inflight, memory_order_relaxed) >= VCAM_REC_MAX_INFLIGHT) {
         atomic_fetch_add_explicit(&_framesDroppedInflight, 1, memory_order_relaxed);
@@ -204,7 +232,11 @@ static CVPixelBufferRef vcam_copyPixelBuffer(CVPixelBufferRef src) {
     os_unfair_lock_lock(&_candLock);
     px = _candPixels; w = _candW; h = _candH; fmt = _candFmt;
     os_unfair_lock_unlock(&_candLock);
-    if (px == 0) { [self scheduleProbeForGen:gen]; return; }      // no frames yet; keep watching
+    if (px == 0) {                                               // no frames yet; keep watching
+        [self writeStatus:@"arming" extra:@"waiting for camera frames — open the Camera"];
+        [self scheduleProbeForGen:gen];
+        return;
+    }
     [self buildWriterW:w h:h fmt:fmt];
 }
 
@@ -261,6 +293,7 @@ static CVPixelBufferRef vcam_copyPixelBuffer(CVPixelBufferRef src) {
     [_writer addInput:_input];
 
     _sessionStarted = NO; _finishing = NO;
+    atomic_store(&_writerStatus, (int)_writer.status);
     _lockW = w; _lockH = h; _lockFmt = fmt;
     atomic_store_explicit(&_locked, true, memory_order_release);
 
@@ -295,6 +328,7 @@ static CVPixelBufferRef vcam_copyPixelBuffer(CVPixelBufferRef src) {
     } else {
         atomic_fetch_add_explicit(&_framesNotReady, 1, memory_order_relaxed);
     }
+    atomic_store(&_writerStatus, (int)_writer.status);
     CFRelease(copy);
     atomic_fetch_sub_explicit(&_inflight, 1, memory_order_relaxed);
 }
@@ -329,6 +363,8 @@ static CVPixelBufferRef vcam_copyPixelBuffer(CVPixelBufferRef src) {
     _writer = nil; _input = nil; _adaptor = nil;
     _sessionStarted = NO; _finishing = NO; _outPath = nil;
     _lockW = _lockH = 0; _lockFmt = 0;
+    _hasTarget = NO; _targetW = _targetH = 0; _targetFmt = 0;
+    atomic_store(&_writerStatus, 0);
     atomic_store_explicit(&_locked, false, memory_order_relaxed);
 }
 
@@ -344,15 +380,22 @@ static CVPixelBufferRef vcam_copyPixelBuffer(CVPixelBufferRef src) {
     [s appendString:@"\n--- recorder ---\n"];
     BOOL armed = atomic_load(&_armed);
     BOOL locked = atomic_load(&_locked);
-    [s appendFormat:@"armed=%d locked=%d", armed, locked];
+    // Writer status: 0=unknown 1=writing 2=completed 3=failed 4=cancelled.
+    static const char *ws[] = {"unknown","writing","completed","failed","cancelled"};
+    int wst = atomic_load(&_writerStatus);
+    [s appendFormat:@"armed=%d locked=%d target=%@ writer=%s", armed, locked,
+        _hasTarget ? @"explicit" : @"auto-largest", (wst >= 0 && wst <= 4) ? ws[wst] : "?"];
     if (locked) {
         char fcc[5] = {0};
         fcc[0]=(_lockFmt>>24)&0xff; fcc[1]=(_lockFmt>>16)&0xff; fcc[2]=(_lockFmt>>8)&0xff; fcc[3]=_lockFmt&0xff;
         [s appendFormat:@" geom=%zux%zu '%s'", _lockW, _lockH, fcc];
     }
-    [s appendFormat:@"\nwritten=%llu notReady=%llu appendFail=%llu dropInflight=%llu copyFail=%llu inflight=%d\n",
-        atomic_load(&_framesWritten), atomic_load(&_framesNotReady), atomic_load(&_framesAppendFail),
-        atomic_load(&_framesDroppedInflight), atomic_load(&_framesCopyFail), atomic_load(&_inflight)];
+    // framesSeen = frames matching the locked geometry that reached us. If framesSeen keeps rising
+    // while written stalls, the encoder (not the camera) is the bottleneck.
+    [s appendFormat:@"\nseen=%llu written=%llu notReady=%llu appendFail=%llu dropInflight=%llu copyFail=%llu inflight=%d\n",
+        atomic_load(&_framesSeen), atomic_load(&_framesWritten), atomic_load(&_framesNotReady),
+        atomic_load(&_framesAppendFail), atomic_load(&_framesDroppedInflight),
+        atomic_load(&_framesCopyFail), atomic_load(&_inflight)];
     if (_outPath) [s appendFormat:@"file=%@\n", _outPath.lastPathComponent];
     return s;
 }
