@@ -1,0 +1,9 @@
+Package: com.vcamplus.reccc
+Name: VCamdebug Record CC
+Version: 0.9.4
+Architecture: iphoneos-arm64
+Depends: firmware (>= 16.0), com.opa334.ccsupport
+Description: Control Center toggle to start/stop VCamdebug recording without leaving the foreground app
+Author: VCamdebug
+Maintainer: VCamdebug
+Section: Tweaks
