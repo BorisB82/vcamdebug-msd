@@ -4,7 +4,12 @@
 #import <notify.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <PhotosUI/PhotosUI.h>
+#import <Photos/Photos.h>
 #import <UserNotifications/UserNotifications.h>
+
+// Recorder output (must match VCamRecorder.m in the tweak).
+static NSString *const kRecDir        = @"/var/mobile/Media/DCIM/VCamRec";
+static NSString *const kImportedPlist = @"/var/mobile/Media/DCIM/VCamRec/vcam_imported.plist";
 
 // Must match VCamCore.m in the tweak.
 static NSString *const kConfigPlist = @"/var/mobile/Media/DCIM/vcam_msd.plist";
@@ -63,6 +68,7 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     [self refresh];
+    [self importRecordings:NO];   // silently pull any new clips into the camera roll
 }
 
 #pragma mark - Header (status + action buttons)
@@ -99,9 +105,9 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
     // notification so recording can be controlled from the lock screen / Notification Center.
     self.recordButton = [self actionButton:@"● Record" sel:@selector(tapRecord)
                                      color:UIColor.systemRedColor];
-    UIButton *notif = [self actionButton:@"Lock-screen controls" sel:@selector(tapPostNotification)
-                                   color:UIColor.systemIndigoColor];
-    UIStackView *recRow = [[UIStackView alloc] initWithArrangedSubviews:@[self.recordButton, notif]];
+    UIButton *importBtn = [self actionButton:@"Import to Photos" sel:@selector(tapImportPhotos)
+                                       color:UIColor.systemIndigoColor];
+    UIStackView *recRow = [[UIStackView alloc] initWithArrangedSubviews:@[self.recordButton, importBtn]];
     recRow.axis = UILayoutConstraintAxisHorizontal;
     recRow.distribution = UIStackViewDistributionFillEqually;
     recRow.spacing = 10;
@@ -181,22 +187,61 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
     [self refreshStatusSoon];
 }
 
-// Surface the interactive notification so recording can be driven from the lock screen. Checks
-// authorization first so "accepted but nothing appears" gives a clear reason.
-- (void)tapPostNotification {
-    UNUserNotificationCenter *c = UNUserNotificationCenter.currentNotificationCenter;
-    [c getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *st) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            BOOL ok = st.authorizationStatus == UNAuthorizationStatusAuthorized ||
-                      st.authorizationStatus == UNAuthorizationStatusProvisional;
-            if (!ok) {
-                [self alert:@"Notifications not allowed"
-                    message:@"Enable notifications for VCam Control in Settings → Notifications, "
-                            "then tap this again. (The in-app Record button works regardless.)"];
-                return;
+- (void)tapImportPhotos { [self importRecordings:YES]; }
+
+#pragma mark - Camera-roll import
+
+- (NSMutableSet<NSString *> *)importedSet {
+    NSArray *a = [NSArray arrayWithContentsOfFile:kImportedPlist];
+    return a ? [NSMutableSet setWithArray:a] : [NSMutableSet set];
+}
+
+- (NSArray<NSString *> *)recordingFilenames {
+    NSMutableArray *movs = [NSMutableArray array];
+    for (NSString *f in [NSFileManager.defaultManager contentsOfDirectoryAtPath:kRecDir error:nil])
+        if ([f.pathExtension.lowercaseString isEqualToString:@"mov"]) [movs addObject:f];
+    [movs sortUsingSelector:@selector(localizedStandardCompare:)];
+    return movs;
+}
+
+// Copy any not-yet-imported .mov clips from DCIM/VCamRec into the Photos camera roll, tracking
+// imported filenames so each is added once. `announce` shows UI feedback; silent on auto-runs.
+- (void)importRecordings:(BOOL)announce {
+    NSMutableSet<NSString *> *imported = [self importedSet];
+    NSMutableArray<NSString *> *toImport = [NSMutableArray array];
+    for (NSString *f in [self recordingFilenames])
+        if (![imported containsObject:f]) [toImport addObject:f];
+    if (toImport.count == 0) { if (announce) [self flash:@"No new recordings"]; return; }
+
+    void (^doImport)(void) = ^{
+        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+            for (NSString *f in toImport) {
+                NSURL *u = [NSURL fileURLWithPath:[kRecDir stringByAppendingPathComponent:f]];
+                [PHAssetCreationRequest creationRequestForAssetFromVideoAtFileURL:u];
             }
-            [VCCAppDelegate presentRecordingNotificationRecording:VCCRecIsRecording()];
-            [self flash:@"Control posted — pull down the banner for Start/Stop"];
+        } completionHandler:^(BOOL ok, NSError *e) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (ok) {
+                    [imported addObjectsFromArray:toImport];
+                    [imported.allObjects writeToFile:kImportedPlist atomically:YES];
+                    if (announce) [self flash:[NSString stringWithFormat:@"Imported %lu to camera roll",
+                                               (unsigned long)toImport.count]];
+                } else if (announce) {
+                    [self alert:@"Import failed" message:e.localizedDescription ?: @"Photos refused the add"];
+                }
+                [self updateStatusLabel];
+            });
+        }];
+    };
+
+    PHAuthorizationStatus st = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly];
+    if (st == PHAuthorizationStatusAuthorized) { doImport(); return; }
+    [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelAddOnly
+                                               handler:^(PHAuthorizationStatus s2) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (s2 == PHAuthorizationStatusAuthorized) doImport();
+            else if (announce) [self alert:@"Photos access needed"
+                                   message:@"Allow adding to Photos in Settings → VCam Control → Photos."];
         });
     }];
 }
@@ -504,10 +549,17 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
                                 : [NSString stringWithFormat:@"rec: %@", recState];
     }
 
+    NSUInteger total = [self recordingFilenames].count;
+    NSUInteger done = 0;
+    NSMutableSet *imp = [self importedSet];
+    for (NSString *f in [self recordingFilenames]) if ([imp containsObject:f]) done++;
+    NSString *recFiles = [NSString stringWithFormat:@"recordings: %lu  (%lu in camera roll)",
+                          (unsigned long)total, (unsigned long)done];
+
     self.statusLabel.text = [NSString stringWithFormat:
-        @"tweak: %@  enabled=%@  mode=%@%@\nsource: %@\n%@\n%@",
+        @"tweak: %@  enabled=%@  mode=%@%@\nsource: %@\n%@\n%@\n%@",
         statsSeen ? @"present" : @"not found (open Camera once)",
-        enabled, [self valueFor:@"mode=" in:stats] ?: @"?", rateLine, src, ndiLine, recLine];
+        enabled, [self valueFor:@"mode=" in:stats] ?: @"?", rateLine, src, ndiLine, recLine, recFiles];
 }
 
 // Pulls the token immediately after `key` up to whitespace from the stats text.

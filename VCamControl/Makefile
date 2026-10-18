@@ -7,7 +7,7 @@ include $(THEOS)/makefiles/common.mk
 APPLICATION_NAME = VCamControl
 
 VCamControl_FILES        = main.m VCCAppDelegate.m VCCRootViewController.m
-VCamControl_FRAMEWORKS   = UIKit Foundation UniformTypeIdentifiers PhotosUI UserNotifications
+VCamControl_FRAMEWORKS   = UIKit Foundation UniformTypeIdentifiers PhotosUI Photos UserNotifications
 VCamControl_CFLAGS       = -fobjc-arc -Wno-deprecated-declarations
 VCamControl_CODESIGN_FLAGS = -Sentitlements.plist
 
