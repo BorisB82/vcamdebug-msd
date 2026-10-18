@@ -1,0 +1,9 @@
+Package: com.vcamplus.activator
+Name: VCamdebug Activator
+Version: 0.9.3
+Architecture: iphoneos-arm64
+Depends: firmware (>= 15.0), mobilesubstrate
+Description: Activator actions to start/stop/toggle VCamdebug recording from any gesture (requires Activator)
+Author: VCamdebug
+Maintainer: VCamdebug
+Section: Tweaks
