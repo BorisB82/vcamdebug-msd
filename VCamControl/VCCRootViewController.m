@@ -5,6 +5,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <PhotosUI/PhotosUI.h>
 #import <Photos/Photos.h>
+#import <AVFoundation/AVFoundation.h>
 #import <UserNotifications/UserNotifications.h>
 
 // Recorder output (must match VCamRecorder.m in the tweak).
@@ -189,59 +190,148 @@ static NSString *const kNDIStatsFile = @"/var/mobile/Media/DCIM/vcam_ndi_stats.t
 
 - (void)tapImportPhotos { [self importRecordings:YES]; }
 
-#pragma mark - Camera-roll import
+#pragma mark - Camera-roll import (merge each recording session into one file)
 
-- (NSMutableSet<NSString *> *)importedSet {
+static NSString *const kMergedTag = @"_merged";
+
+- (NSMutableSet<NSString *> *)importedSessions {
     NSArray *a = [NSArray arrayWithContentsOfFile:kImportedPlist];
     return a ? [NSMutableSet setWithArray:a] : [NSMutableSet set];
 }
 
-- (NSArray<NSString *> *)recordingFilenames {
-    NSMutableArray *movs = [NSMutableArray array];
-    for (NSString *f in [NSFileManager.defaultManager contentsOfDirectoryAtPath:kRecDir error:nil])
-        if ([f.pathExtension.lowercaseString isEqualToString:@"mov"]) [movs addObject:f];
-    [movs sortUsingSelector:@selector(localizedStandardCompare:)];
-    return movs;
+- (void)markSessionImported:(NSString *)ts {
+    NSMutableSet *d = [self importedSessions];
+    [d addObject:ts];
+    [d.allObjects writeToFile:kImportedPlist atomically:YES];
 }
 
-// Copy any not-yet-imported .mov clips from DCIM/VCamRec into the Photos camera roll, tracking
-// imported filenames so each is added once. `announce` shows UI feedback; silent on auto-runs.
-- (void)importRecordings:(BOOL)announce {
-    NSMutableSet<NSString *> *imported = [self importedSet];
-    NSMutableArray<NSString *> *toImport = [NSMutableArray array];
-    for (NSString *f in [self recordingFilenames])
-        if (![imported containsObject:f]) [toImport addObject:f];
-    if (toImport.count == 0) { if (announce) [self flash:@"No new recordings"]; return; }
+// sessionTs -> ordered clip filenames (clip NN sorted). One recording = one sessionTs
+// (vcam_<yyyyMMdd_HHmmss>_NN_...). Excludes already-merged outputs.
+- (NSDictionary<NSString *, NSArray<NSString *> *> *)recordingSessions {
+    NSMutableDictionary<NSString *, NSMutableArray<NSString *> *> *sessions = [NSMutableDictionary dictionary];
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+        @"^vcam_(\\d{8}_\\d{6})_\\d+_" options:0 error:nil];
+    for (NSString *f in [NSFileManager.defaultManager contentsOfDirectoryAtPath:kRecDir error:nil]) {
+        if (![f.pathExtension.lowercaseString isEqualToString:@"mov"]) continue;
+        if ([f containsString:kMergedTag]) continue;
+        NSTextCheckingResult *m = [re firstMatchInString:f options:0 range:NSMakeRange(0, f.length)];
+        if (!m) continue;
+        NSString *ts = [f substringWithRange:[m rangeAtIndex:1]];
+        if (!sessions[ts]) sessions[ts] = [NSMutableArray array];
+        [sessions[ts] addObject:f];
+    }
+    for (NSString *ts in sessions) [sessions[ts] sortUsingSelector:@selector(localizedStandardCompare:)];
+    return sessions;
+}
 
-    void (^doImport)(void) = ^{
-        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
-            for (NSString *f in toImport) {
-                NSURL *u = [NSURL fileURLWithPath:[kRecDir stringByAppendingPathComponent:f]];
-                [PHAssetCreationRequest creationRequestForAssetFromVideoAtFileURL:u];
-            }
-        } completionHandler:^(BOOL ok, NSError *e) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (ok) {
-                    [imported addObjectsFromArray:toImport];
-                    [imported.allObjects writeToFile:kImportedPlist atomically:YES];
-                    if (announce) [self flash:[NSString stringWithFormat:@"Imported %lu to camera roll",
-                                               (unsigned long)toImport.count]];
-                } else if (announce) {
-                    [self alert:@"Import failed" message:e.localizedDescription ?: @"Photos refused the add"];
-                }
-                [self updateStatusLabel];
-            });
-        }];
-    };
+- (NSUInteger)pendingSessionCount {
+    NSMutableSet *done = [self importedSessions];
+    NSUInteger n = 0;
+    for (NSString *ts in [self recordingSessions]) if (![done containsObject:ts]) n++;
+    return n;
+}
+
+// Merge each recording session's clips (lossless HEVC passthrough) into one file and import that
+// single file into the camera roll; silent on auto-runs. Skipped while recording.
+- (void)importRecordings:(BOOL)announce {
+    if (VCCRecIsRecording()) {
+        if (announce) [self alert:@"Recording in progress" message:@"Stop recording before importing."];
+        return;
+    }
+    NSDictionary<NSString *, NSArray<NSString *> *> *sessions = [self recordingSessions];
+    NSMutableSet *done = [self importedSessions];
+    NSMutableArray<NSString *> *pending = [NSMutableArray array];
+    for (NSString *ts in sessions) if (![done containsObject:ts]) [pending addObject:ts];
+    if (pending.count == 0) { if (announce) [self flash:@"No new recordings"]; return; }
 
     PHAuthorizationStatus st = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly];
-    if (st == PHAuthorizationStatusAuthorized) { doImport(); return; }
-    [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelAddOnly
-                                               handler:^(PHAuthorizationStatus s2) {
+    void (^go)(void) = ^{
+        for (NSString *ts in pending) [self mergeAndImportSession:ts clips:sessions[ts] announce:announce];
+    };
+    if (st == PHAuthorizationStatusAuthorized) { go(); return; }
+    [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelAddOnly handler:^(PHAuthorizationStatus s2) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (s2 == PHAuthorizationStatusAuthorized) doImport();
+            if (s2 == PHAuthorizationStatusAuthorized) go();
             else if (announce) [self alert:@"Photos access needed"
                                    message:@"Allow adding to Photos in Settings → VCam Control → Photos."];
+        });
+    }];
+}
+
+- (void)mergeAndImportSession:(NSString *)ts clips:(NSArray<NSString *> *)clips announce:(BOOL)announce {
+    NSMutableArray<NSURL *> *urls = [NSMutableArray array];
+    for (NSString *f in clips) [urls addObject:[NSURL fileURLWithPath:[kRecDir stringByAppendingPathComponent:f]]];
+
+    // Single clip: nothing to merge — import the file as-is and keep it.
+    if (urls.count == 1) {
+        [self importURL:urls.firstObject success:^{
+            [self markSessionImported:ts];
+            if (announce) [self flash:@"Imported to camera roll"];
+            [self updateStatusLabel];
+        } fail:^(NSError *e) { if (announce) [self alert:@"Import failed" message:e.localizedDescription]; }];
+        return;
+    }
+
+    [self mergeURLs:urls session:ts completion:^(NSURL *mergedURL, NSError *mergeErr) {
+        if (mergedURL) {
+            [self importURL:mergedURL success:^{
+                for (NSURL *u in urls) [NSFileManager.defaultManager removeItemAtURL:u error:nil]; // keep only the merged file
+                [self markSessionImported:ts];
+                if (announce) [self flash:@"Merged + imported to camera roll"];
+                [self updateStatusLabel];
+            } fail:^(NSError *e) { if (announce) [self alert:@"Import failed" message:e.localizedDescription]; }];
+        } else {
+            // Passthrough merge failed (e.g. a session mixed resolutions) → import the pieces individually.
+            for (NSURL *u in urls) [self importURL:u success:nil fail:nil];
+            [self markSessionImported:ts];
+            if (announce) [self flash:@"Imported (unmerged — mixed sizes)"];
+            [self updateStatusLabel];
+        }
+    }];
+}
+
+// Lossless concatenation of same-codec/same-size HEVC clips via a passthrough export.
+- (void)mergeURLs:(NSArray<NSURL *> *)urls session:(NSString *)ts
+       completion:(void (^)(NSURL *mergedURL, NSError *err))completion {
+    AVMutableComposition *comp = [AVMutableComposition composition];
+    AVMutableCompositionTrack *track =
+        [comp addMutableTrackWithMediaType:AVMediaTypeVideo preferredTrackID:kCMPersistentTrackID_Invalid];
+    CMTime cursor = kCMTimeZero;
+    BOOL any = NO;
+    for (NSURL *u in urls) {
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:u options:nil];
+        AVAssetTrack *vt = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+        if (!vt) continue;
+        if ([track insertTimeRange:CMTimeRangeMake(kCMTimeZero, asset.duration) ofTrack:vt atTime:cursor error:nil]) {
+            if (!any) track.preferredTransform = vt.preferredTransform;
+            cursor = CMTimeAdd(cursor, asset.duration);
+            any = YES;
+        }
+    }
+    if (!any) { completion(nil, nil); return; }
+
+    NSURL *outURL = [NSURL fileURLWithPath:[kRecDir stringByAppendingPathComponent:
+                     [NSString stringWithFormat:@"vcam_%@%@.mov", ts, kMergedTag]]];
+    [NSFileManager.defaultManager removeItemAtURL:outURL error:nil];
+
+    AVAssetExportSession *ex = [[AVAssetExportSession alloc] initWithAsset:comp
+                                                               presetName:AVAssetExportPresetPassthrough];
+    if (!ex) { completion(nil, nil); return; }
+    ex.outputURL = outURL;
+    ex.outputFileType = AVFileTypeQuickTimeMovie;
+    [ex exportAsynchronouslyWithCompletionHandler:^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(ex.status == AVAssetExportSessionStatusCompleted ? outURL : nil, ex.error);
+        });
+    }];
+}
+
+- (void)importURL:(NSURL *)url success:(void (^)(void))success fail:(void (^)(NSError *))fail {
+    [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+        [PHAssetCreationRequest creationRequestForAssetFromVideoAtFileURL:url];
+    } completionHandler:^(BOOL ok, NSError *e) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (ok) { if (success) success(); } else { if (fail) fail(e); }
         });
     }];
 }
@@ -549,12 +639,10 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
                                 : [NSString stringWithFormat:@"rec: %@", recState];
     }
 
-    NSUInteger total = [self recordingFilenames].count;
-    NSUInteger done = 0;
-    NSMutableSet *imp = [self importedSet];
-    for (NSString *f in [self recordingFilenames]) if ([imp containsObject:f]) done++;
-    NSString *recFiles = [NSString stringWithFormat:@"recordings: %lu  (%lu in camera roll)",
-                          (unsigned long)total, (unsigned long)done];
+    NSUInteger pending = [self pendingSessionCount];
+    NSString *recFiles = pending ? [NSString stringWithFormat:@"recordings: %lu session(s) to import",
+                                    (unsigned long)pending]
+                                 : @"recordings: all imported to camera roll";
 
     self.statusLabel.text = [NSString stringWithFormat:
         @"tweak: %@  enabled=%@  mode=%@%@\nsource: %@\n%@\n%@\n%@",
