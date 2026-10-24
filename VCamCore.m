@@ -76,6 +76,7 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
     double _lastDumpUptime;
     uint64_t _lastHitSnap;
     uint64_t _lastRebuildSnap;
+    uint64_t _lastSrcIDSnap;   // for true decoded source fps
 
     dispatch_source_t _statsTimer;
 
@@ -240,27 +241,32 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
     // freshFps while enabled means the source is starving the consumer (cpu/network).
     double upNow = NSProcessInfo.processInfo.systemUptime;
     uint64_t hitNow = atomic_load(&_hitTotal);
-    double emitFps = 0.0, freshFps = 0.0;
+    uint64_t srcIDNow = _activeSource ? [_activeSource latestFrameID] : 0;
+    double emitFps = 0.0, renderFps = 0.0, srcFps = 0.0;
     if (_lastDumpUptime > 0.0) {
         double dt = upNow - _lastDumpUptime;
         if (dt > 0.0) {
-            emitFps  = (double)(hitNow - _lastHitSnap) / dt;
-            freshFps = (double)(cacheRebuilds - _lastRebuildSnap) / dt;
+            emitFps   = (double)(hitNow - _lastHitSnap) / dt;        // emit-hook calls/sec (all surfaces)
+            renderFps = (double)(cacheRebuilds - _lastRebuildSnap) / dt;  // GPU renders/sec (all geometries)
+            srcFps    = (double)(srcIDNow - _lastSrcIDSnap) / dt;    // TRUE decoded source frames/sec
         }
     }
     _lastDumpUptime = upNow; _lastHitSnap = hitNow; _lastRebuildSnap = cacheRebuilds;
+    _lastSrcIDSnap = srcIDNow;
 
     NSMutableString *s = [NSMutableString stringWithCapacity:1024];
     [s appendFormat:@"=== vcam-msd stats @ %@ ===\n",
         [NSDateFormatter localizedStringFromDate:NSDate.date
                                        dateStyle:NSDateFormatterShortStyle
                                        timeStyle:NSDateFormatterMediumStyle]];
-    [s appendFormat:@"SUMMARY emitFps=%.1f freshFps=%.1f  (freshFps = real image update rate)\n",
-        emitFps, freshFps];
+    [s appendFormat:@"SUMMARY srcFps=%.1f emitFps=%.1f renderFps=%.1f\n"
+        @"  (srcFps = TRUE decoded source rate; emitFps = hook calls/sec all surfaces; "
+        @"renderFps = GPU renders/sec all geometries)\n",
+        srcFps, emitFps, renderFps];
     if (atomic_load(&_enabled)) {
-        [s appendFormat:@"VERDICT: %@\n", freshFps < 20.0
-            ? @"source STARVED — fresh frames not arriving fast enough (cpu/network)"
-            : @"source healthy"];
+        [s appendFormat:@"VERDICT: %@\n", srcFps < 20.0
+            ? @"source STARVED — decoder not producing frames fast enough (cpu/disk)"
+            : @"source healthy — decode is keeping pace"];
     }
     [s appendFormat:@"playerStarted=%d enabled=%d\n", _playerStarted, atomic_load(&_enabled)];
     [s appendFormat:@"mode=%@ source=%@\n", _ndiMode ? @"ndi" : @"file", _ndiMode ? @"(ndi shm)" : _sourcePath];

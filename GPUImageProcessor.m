@@ -18,6 +18,12 @@
 
 #define VCAM_GEOM_POOL 3
 
+// Per-source-frame GPU render budget. The primary (most-emitted) geometry is always rendered;
+// secondary geometries are refreshed only while this budget lasts, rotated for fairness. At
+// ~9ms/render on A11, rendering every live geometry (up to 6) per frame overran the 33ms source
+// interval and the pump fell behind. ~22ms leaves headroom for the camera pipeline + the copy.
+static const double kVCamRenderBudgetSec = 0.022;
+
 static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) {
     if (CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return NO;
     if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) {
@@ -72,6 +78,7 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
     _Atomic uint64_t _renderCount, _renderTotalNs, _renderMaxNs, _hitCount, _failCount;
     _Atomic uint64_t _renderPasses;     // source frames that rendered >=1 geometry
     _Atomic uint64_t _maxGeomsPerPass;  // peak geometries rendered in one source frame
+    NSUInteger _rrCursor;               // round-robin cursor over secondary geometries
 }
 
 - (instancetype)init {
@@ -121,6 +128,41 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
     } @catch (id ex) { NSLog(@"[vcam-msd] render exception: %@", ex); return NO; }
 }
 
+// Render the source image into one geometry's next pool slot and publish it as that geometry's
+// ready buffer. Returns YES if a frame was rendered. Called only from renderSource: (render queue).
+- (BOOL)renderGeom:(VCamGeom *)g srcImg:(CIImage *)srcImg srcID:(uint64_t)srcID {
+    os_unfair_lock_lock(&_lock);
+    int idx = g->poolIdx;
+    CVPixelBufferRef buf = g->pool[idx];
+    if (!buf) {
+        NSDictionary *attrs = @{ (NSString *)kCVPixelBufferIOSurfacePropertiesKey : @{} };
+        if (CVPixelBufferCreate(kCFAllocatorDefault, g->w, g->h, g->fmt,
+                                (__bridge CFDictionaryRef)attrs, &buf) == kCVReturnSuccess) {
+            g->pool[idx] = buf;
+        } else buf = NULL;
+    }
+    size_t w = g->w, h = g->h;
+    os_unfair_lock_unlock(&_lock);
+    if (!buf) return NO;
+
+    uint64_t r0 = mach_absolute_time();
+    BOOL ok = [self renderImage:srcImg into:buf w:w h:h];
+    if (!ok) { atomic_fetch_add_explicit(&_failCount, 1, memory_order_relaxed); return NO; }
+
+    uint64_t dt = (mach_absolute_time() - r0) * _tb.numer / _tb.denom;
+    atomic_fetch_add_explicit(&_renderCount, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&_renderTotalNs, dt, memory_order_relaxed);
+    uint64_t prev = atomic_load_explicit(&_renderMaxNs, memory_order_relaxed);
+    while (dt > prev && !atomic_compare_exchange_weak_explicit(&_renderMaxNs, &prev, dt,
+               memory_order_relaxed, memory_order_relaxed)) {}
+
+    os_unfair_lock_lock(&_lock);
+    g->ready = buf; g->readySrcID = srcID; g->renders++;
+    g->poolIdx = (idx + 1) % VCAM_GEOM_POOL;   // next render uses a different slot
+    os_unfair_lock_unlock(&_lock);
+    return YES;
+}
+
 - (void)renderSource:(CVPixelBufferRef)src srcID:(uint64_t)srcID {
     if (!src || !_ci) return;
     CIImage *srcImg = [CIImage imageWithCVPixelBuffer:src];
@@ -135,39 +177,34 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
         if (now - g->lastSeen <= 2.0) [live addObject:g];
     }];
     os_unfair_lock_unlock(&_lock);
+    if (live.count == 0) return;
 
+    // Priority order: the most-emitted geometry is the primary feed (preview/video) and is
+    // rendered every pass so it stays at full rate. Secondary geometries (snapshot/analysis
+    // surfaces) are refreshed only while the render budget lasts, started at a rotating cursor
+    // so none starves across passes. This caps per-frame GPU time so the pump keeps up.
+    NSArray<VCamGeom *> *ordered = [live sortedArrayUsingComparator:^NSComparisonResult(VCamGeom *a, VCamGeom *b) {
+        if (a->emits > b->emits) return NSOrderedAscending;   // more emits = higher priority
+        if (a->emits < b->emits) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+
+    NSMutableArray<VCamGeom *> *todo = [NSMutableArray arrayWithCapacity:ordered.count];
+    [todo addObject:ordered[0]];                 // primary: always
+    NSUInteger sec = ordered.count - 1;          // number of secondary geometries
+    if (sec > 0) {
+        NSUInteger start = _rrCursor % sec;
+        for (NSUInteger i = 0; i < sec; i++)
+            [todo addObject:ordered[1 + ((start + i) % sec)]];
+        _rrCursor = (start + 1) % sec;           // advance one secondary per pass
+    }
+
+    double budgetEnd = now + kVCamRenderBudgetSec;
     uint64_t renderedThisPass = 0;
-    for (VCamGeom *g in live) {
-        os_unfair_lock_lock(&_lock);
-        int idx = g->poolIdx;
-        CVPixelBufferRef buf = g->pool[idx];
-        if (!buf) {
-            NSDictionary *attrs = @{ (NSString *)kCVPixelBufferIOSurfacePropertiesKey : @{} };
-            if (CVPixelBufferCreate(kCFAllocatorDefault, g->w, g->h, g->fmt,
-                                    (__bridge CFDictionaryRef)attrs, &buf) == kCVReturnSuccess) {
-                g->pool[idx] = buf;
-            } else buf = NULL;
-        }
-        size_t w = g->w, h = g->h;
-        os_unfair_lock_unlock(&_lock);
-        if (!buf) continue;
-
-        uint64_t r0 = mach_absolute_time();
-        BOOL ok = [self renderImage:srcImg into:buf w:w h:h];
-        if (!ok) { atomic_fetch_add_explicit(&_failCount, 1, memory_order_relaxed); continue; }
-
-        uint64_t dt = (mach_absolute_time() - r0) * _tb.numer / _tb.denom;
-        atomic_fetch_add_explicit(&_renderCount, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&_renderTotalNs, dt, memory_order_relaxed);
-        uint64_t prev = atomic_load_explicit(&_renderMaxNs, memory_order_relaxed);
-        while (dt > prev && !atomic_compare_exchange_weak_explicit(&_renderMaxNs, &prev, dt,
-                   memory_order_relaxed, memory_order_relaxed)) {}
-        renderedThisPass++;
-
-        os_unfair_lock_lock(&_lock);
-        g->ready = buf; g->readySrcID = srcID; g->renders++;
-        g->poolIdx = (idx + 1) % VCAM_GEOM_POOL;   // next render uses a different slot
-        os_unfair_lock_unlock(&_lock);
+    for (NSUInteger i = 0; i < todo.count; i++) {
+        // Primary (i==0) always renders; stop pulling in secondaries once the budget is spent.
+        if (i > 0 && [self nowSec] >= budgetEnd) break;
+        if ([self renderGeom:todo[i] srcImg:srcImg srcID:srcID]) renderedThisPass++;
     }
 
     // Measure concurrency: how many geometries we actually render per source frame.
