@@ -19,6 +19,7 @@ static const NSTimeInterval kFrameInterval = 1.0 / 30.0;
     BOOL _running;
     AVAssetReader *_reader;
     AVAssetReaderTrackOutput *_output;
+    NSTimeInterval _frameInterval;   // target cadence = 1/source-fps (falls back to 1/30)
 }
 
 - (instancetype)initWithPath:(NSString *)path {
@@ -26,6 +27,7 @@ static const NSTimeInterval kFrameInterval = 1.0 / 30.0;
         _path = [path copy];
         _queue = dispatch_queue_create("com.vcamplus.msd.decoder", DISPATCH_QUEUE_SERIAL);
         _frameLock = OS_UNFAIR_LOCK_INIT;
+        _frameInterval = kFrameInterval;
     }
     return self;
 }
@@ -93,6 +95,8 @@ static const NSTimeInterval kFrameInterval = 1.0 / 30.0;
     };
     _output = [[AVAssetReaderTrackOutput alloc] initWithTrack:tracks[0] outputSettings:settings];
     _output.alwaysCopiesSampleData = NO;
+    float fps = ((AVAssetTrack *)tracks[0]).nominalFrameRate;
+    _frameInterval = (fps > 1.0f && fps <= 120.0f) ? (1.0 / fps) : kFrameInterval;
     if (![_reader canAddOutput:_output]) return NO;
     [_reader addOutput:_output];
     if (![_reader startReading]) {
@@ -104,6 +108,9 @@ static const NSTimeInterval kFrameInterval = 1.0 / 30.0;
 
 - (void)decodeLoop {
     NSLog(@"[vcam-msd] decoder loop starting (path=%@)", _path);
+    // Absolute-deadline pacing: sleep only the time left until the next frame's slot, so the
+    // cadence is the true source fps (1/_frameInterval) rather than decodeTime + interval.
+    NSTimeInterval next = NSProcessInfo.processInfo.systemUptime;
     while (1) {
         BOOL running;
         @synchronized(self) { running = _running; }
@@ -114,8 +121,10 @@ static const NSTimeInterval kFrameInterval = 1.0 / 30.0;
                 _reader = nil; _output = nil;
                 if (![self openReader]) {
                     [NSThread sleepForTimeInterval:0.5];
+                    next = NSProcessInfo.processInfo.systemUptime;
                     continue;
                 }
+                next = NSProcessInfo.processInfo.systemUptime;   // resync at (re)open / loop point
             }
 
             CMSampleBufferRef sb = [_output copyNextSampleBuffer];
@@ -137,7 +146,13 @@ static const NSTimeInterval kFrameInterval = 1.0 / 30.0;
             CFRelease(sb);
         }
 
-        [NSThread sleepForTimeInterval:kFrameInterval];
+        // Pace to the next slot; if decoding already overran it, don't sleep (and resync so we
+        // don't spiral) — the decode itself is then the limiter, not an added sleep.
+        next += _frameInterval;
+        NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+        NSTimeInterval delay = next - now;
+        if (delay > 0) [NSThread sleepForTimeInterval:delay];
+        else next = now;
     }
     NSLog(@"[vcam-msd] decoder loop exiting");
 }
