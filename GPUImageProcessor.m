@@ -12,6 +12,7 @@
 #import "GPUImageProcessor.h"
 #import <CoreImage/CoreImage.h>
 #import <Metal/Metal.h>
+#import <VideoToolbox/VideoToolbox.h>
 #import <mach/mach_time.h>
 #import <os/lock.h>
 #import <stdatomic.h>
@@ -70,6 +71,7 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
     id<MTLDevice> _device;
     CIContext *_ci;
     CGColorSpaceRef _cs;
+    VTPixelTransferSessionRef _vt;   // hw scale+convert; created lazily, used only on _renderQueue
     os_unfair_lock _lock;
     NSMutableDictionary<NSString *, VCamGeom *> *_geoms;
     mach_timebase_info_data_t _tb;
@@ -97,7 +99,27 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
     return self;
 }
 
-- (void)dealloc { if (_cs) CGColorSpaceRelease(_cs); }
+- (void)dealloc {
+    if (_cs) CGColorSpaceRelease(_cs);
+    if (_vt) { VTPixelTransferSessionInvalidate(_vt); CFRelease(_vt); }
+}
+
+// Lazily create the shared pixel-transfer session. Only ever touched on _renderQueue (serial),
+// so no locking. Crop-to-fill: scale preserving aspect, fill the whole destination, trim the
+// overhang. No distortion, no letterbox bars. A same-size request becomes a pure format convert.
+- (VTPixelTransferSessionRef)vtSession {
+    if (_vt) return _vt;
+    VTPixelTransferSessionRef s = NULL;
+    OSStatus st = VTPixelTransferSessionCreate(kCFAllocatorDefault, &s);
+    if (st != noErr || !s) {
+        NSLog(@"[vcam-msd] VTPixelTransferSessionCreate failed: %d (falling back to CIContext)", (int)st);
+        return NULL;
+    }
+    VTSessionSetProperty(s, kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Trim);
+    _vt = s;
+    NSLog(@"[vcam-msd] VTPixelTransferSession ready (crop-to-fill)");
+    return _vt;
+}
 
 - (void)setRotationDegrees:(int)degrees {
     atomic_store_explicit(&_rotation, ((degrees % 360) + 360) % 360, memory_order_relaxed);
@@ -128,9 +150,11 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
     } @catch (id ex) { NSLog(@"[vcam-msd] render exception: %@", ex); return NO; }
 }
 
-// Render the source image into one geometry's next pool slot and publish it as that geometry's
+// Render the source frame into one geometry's next pool slot and publish it as that geometry's
 // ready buffer. Returns YES if a frame was rendered. Called only from renderSource: (render queue).
-- (BOOL)renderGeom:(VCamGeom *)g srcImg:(CIImage *)srcImg srcID:(uint64_t)srcID {
+// Fast path: VTPixelTransferSession (dedicated hw, ~1-2ms) for scale+convert, crop-to-fill. Falls
+// back to the CoreImage path only for rotation, or if VT can't handle a format/transfer.
+- (BOOL)renderGeom:(VCamGeom *)g src:(CVPixelBufferRef)src srcID:(uint64_t)srcID {
     os_unfair_lock_lock(&_lock);
     int idx = g->poolIdx;
     CVPixelBufferRef buf = g->pool[idx];
@@ -146,7 +170,16 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
     if (!buf) return NO;
 
     uint64_t r0 = mach_absolute_time();
-    BOOL ok = [self renderImage:srcImg into:buf w:w h:h];
+    BOOL ok = NO;
+    int rot = atomic_load_explicit(&_rotation, memory_order_relaxed);
+    if (rot == 0) {   // VT does scale + RGB->YUV; rotation needs the CoreImage path
+        VTPixelTransferSessionRef s = [self vtSession];
+        if (s) ok = (VTPixelTransferSessionTransferImage(s, src, buf) == noErr);
+    }
+    if (!ok) {         // rotation, VT unavailable, or an exotic dst format VT rejected
+        CIImage *srcImg = [CIImage imageWithCVPixelBuffer:src];
+        if (srcImg) ok = [self renderImage:srcImg into:buf w:w h:h];
+    }
     if (!ok) { atomic_fetch_add_explicit(&_failCount, 1, memory_order_relaxed); return NO; }
 
     uint64_t dt = (mach_absolute_time() - r0) * _tb.numer / _tb.denom;
@@ -164,12 +197,12 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
 }
 
 - (void)renderSource:(CVPixelBufferRef)src srcID:(uint64_t)srcID {
-    if (!src || !_ci) return;
-    CIImage *srcImg = [CIImage imageWithCVPixelBuffer:src];
-    if (!srcImg) return;
+    if (!src) return;
 
     // Render only geometries emitted-to recently, but KEEP all entries so the diagnostic report
-    // survives the camera app being backgrounded (retiring entries erased the report).
+    // survives the camera app being backgrounded (retiring entries erased the report). A
+    // backgrounded app stops emitting, so its surfaces age out of this set within 2s and the
+    // app you are actually using gets the GPU.
     double now = [self nowSec];
     os_unfair_lock_lock(&_lock);
     NSMutableArray<VCamGeom *> *live = [NSMutableArray array];
@@ -204,7 +237,7 @@ static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) 
     for (NSUInteger i = 0; i < todo.count; i++) {
         // Primary (i==0) always renders; stop pulling in secondaries once the budget is spent.
         if (i > 0 && [self nowSec] >= budgetEnd) break;
-        if ([self renderGeom:todo[i] srcImg:srcImg srcID:srcID]) renderedThisPass++;
+        if ([self renderGeom:todo[i] src:src srcID:srcID]) renderedThisPass++;
     }
 
     // Measure concurrency: how many geometries we actually render per source frame.

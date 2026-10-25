@@ -283,14 +283,14 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
     [s appendFormat:@"  vtSuccess:     %llu\n", atomic_load(&_hitVTSuccess)];
     [s appendFormat:@"  vtFail:        %llu (lastStatus=%d)\n",
         atomic_load(&_hitVTFail), [_gpuProcessor lastFailStatus]];
-    [s appendFormat:@"\n--- VT latency (P0+cache: RealTime + CropMode + cached transfer) ---\n"];
-    [s appendFormat:@"vtCount:        %llu  (every emit that called transferFrom)\n", vtCount];
-    [s appendFormat:@"vtMeanUs:       %.1f µs  (overall, mixing fast and slow path)\n", vtMeanUs];
+    [s appendFormat:@"\n--- transfer engine (VTPixelTransfer crop-to-fill; CIContext fallback for rotation) ---\n"];
+    [s appendFormat:@"vtCount:        %llu  (renders + emit-path copies)\n", vtCount];
+    [s appendFormat:@"vtMeanUs:       %.1f µs\n", vtMeanUs];
     [s appendFormat:@"vtMaxUs:        %.1f µs\n", vtMaxUs];
-    [s appendFormat:@"cacheHits:      %llu  (fast path = cached → dst, hardware blit)\n", cacheHits];
-    [s appendFormat:@"cacheRebuilds:  %llu  (slow path = src → cached, scale+rotate+convert)\n", cacheRebuilds];
-    [s appendFormat:@"cacheHitRate:   %.1f%%\n", cacheHitRate];
-    [s appendFormat:@"rebuildMeanUs:  %.1f µs  (per slow-path call; expect ~2000µs first-time)\n", rebuildMeanUs];
+    [s appendFormat:@"emitCopies:     %llu  (emit path = ready → camera buffer, cpu memcpy)\n", cacheHits];
+    [s appendFormat:@"renders:        %llu  (off-thread src → geometry buffer, scale+convert)\n", cacheRebuilds];
+    [s appendFormat:@"copyRate:       %.1f%%\n", cacheHitRate];
+    [s appendFormat:@"renderMeanUs:   %.1f µs  (per render; VT ~1500µs, CIContext ~9000-14000µs)\n", rebuildMeanUs];
 
     extern _Atomic int gInstallPollCount;
     extern _Atomic int gInstallState;

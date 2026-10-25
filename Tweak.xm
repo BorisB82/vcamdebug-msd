@@ -137,7 +137,7 @@ static void vcamplus_msd_init(void) {
     @autoreleasepool {
         NSString *proc = NSProcessInfo.processInfo.processName;
         if (![proc isEqualToString:@"mediaserverd"]) return;
-        NSLog(@"[vcam-msd] LOADED in mediaserverd (build 0.9.5, budgeted render pump + srcFps stat)");
+        NSLog(@"[vcam-msd] LOADED in mediaserverd (build 0.9.6, VTPixelTransfer engine, crop-to-fill)");
         NSLog(@"[vcam-msd] To activate: touch /var/mobile/Media/DCIM/vcam_msd_active");
         NSLog(@"[vcam-msd] Stats: /var/mobile/Media/DCIM/vcam_msd_stats.txt (every 5s)");
         (void)[VCamCore shared];
