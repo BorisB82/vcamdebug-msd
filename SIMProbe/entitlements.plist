@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Run as a platform (system) app, OUTSIDE an app data container, so it can read the
+	     CommCenter preference files a normal sandboxed app is denied. This is deliberate:
+	     the app labels those rows ROOT ONLY precisely because a sandboxed app can't reach them. -->
+	<key>platform-application</key>
+	<true/>
+	<key>com.apple.private.security.no-container</key>
+	<true/>
+	<key>com.apple.private.security.storage.AppDataContainers</key>
+	<true/>
+	<!-- Ask MobileGestalt to unlock identity keys (IMEI/ICCID/IMSI). The jailbreak may or may
+	     not honour this; if not, those keys simply stay nil and are shown as still-protected. -->
+	<key>com.apple.private.MobileGestalt.AllowedProtectedKeys</key>
+	<array>
+		<string>UniqueDeviceID</string>
+		<string>SerialNumber</string>
+		<string>InternationalMobileEquipmentIdentity</string>
+		<string>InternationalMobileEquipmentIdentity2</string>
+		<string>MobileEquipmentIdentifier</string>
+		<string>IntegratedCircuitCardIdentity</string>
+		<string>InternationalMobileSubscriberIdentity</string>
+	</array>
+</dict>
+</plist>

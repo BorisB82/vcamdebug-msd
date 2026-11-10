@@ -1,0 +1,9 @@
+Package: com.borisb.simprobe
+Name: SIM Probe
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Depends: firmware (>= 15.0)
+Description: Visual probe of SIM / mobile-network info, labelled by the access tier a normal sandboxed app would have (public CoreTelephony vs root CommCenter). On-device privacy research.
+Author: borisb
+Maintainer: borisb
+Section: Utilities
