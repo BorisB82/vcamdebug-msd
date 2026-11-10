@@ -3,11 +3,19 @@ name: Build VCamPlus MSD (roothide)
 on:
   push:
     branches: [ main ]
+    paths:
+      - '*.m'
+      - '*.h'
+      - '*.xm'
+      - 'Makefile'
+      - 'control'
+      - 'common/**'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4

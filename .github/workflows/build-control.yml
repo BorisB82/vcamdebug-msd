@@ -3,11 +3,14 @@ name: Build VCamControl app (roothide)
 on:
   push:
     branches: [ main ]
+    paths:
+      - 'VCamControl/**'
+      - '.github/workflows/build-control.yml'
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4

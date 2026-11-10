@@ -3,11 +3,14 @@ name: Build VCamdebug Activator (roothide)
 on:
   push:
     branches: [ main ]
+    paths:
+      - 'VCamActivator/**'
+      - '.github/workflows/build-activator.yml'
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
